@@ -1,0 +1,5 @@
+/target/
+Cargo.lock
+agent.md
+roadmap.md
+*Zone.Identifier

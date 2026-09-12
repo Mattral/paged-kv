@@ -1,0 +1,5 @@
+[package]
+name = "paged-kv"
+version = "0.1.0"
+edition = "2021"
+description = "Paged KV-cache block management"
