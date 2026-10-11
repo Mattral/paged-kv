@@ -30,8 +30,17 @@ pub enum AllocError {
     Exhausted,
     /// The id is outside this pool.
     InvalidBlock(BlockId),
-    /// `free` was called on a block that is not allocated.
+    /// The block is not currently allocated.
     NotAllocated(BlockId),
+    /// `used` is greater than the block width.
+    InvalidUsed {
+        /// Block the caller tried to update.
+        block: BlockId,
+        /// Requested initialized-token count.
+        used: u32,
+        /// Width of every block in the pool.
+        block_size: u32,
+    },
 }
 
 impl std::fmt::Display for AllocError {
@@ -40,6 +49,14 @@ impl std::fmt::Display for AllocError {
             AllocError::Exhausted => write!(f, "block pool exhausted"),
             AllocError::InvalidBlock(id) => write!(f, "block {id} is outside the pool"),
             AllocError::NotAllocated(id) => write!(f, "block {id} is not allocated"),
+            AllocError::InvalidUsed {
+                block,
+                used,
+                block_size,
+            } => write!(
+                f,
+                "block {block} cannot hold {used} tokens (block size is {block_size})"
+            ),
         }
     }
 }
@@ -55,11 +72,18 @@ impl std::error::Error for AllocError {}
 /// stack, so the block just released is the next one handed out. A fresh
 /// pool is stacked from high ids to low ids, and the first allocations are
 /// `0, 1, 2, ...`.
+///
+/// Blocks are interchangeable, so a hole on the free list is not external
+/// fragmentation. The only waste is internal: allocated blocks whose
+/// initialized token count is below `block_size`. [`BlockPool::wasted_slots`]
+/// reports that tail.
 #[derive(Debug)]
 pub struct BlockPool {
     block_size: u32,
     /// `true` while the block is checked out.
     allocated: Vec<bool>,
+    /// Initialized token slots in each block. Zero when the block is free.
+    used: Vec<u32>,
     /// Free block indices. The next allocation pops the last entry.
     free_list: Vec<u32>,
 }
@@ -78,6 +102,7 @@ impl BlockPool {
         Self {
             block_size,
             allocated: vec![false; num_blocks as usize],
+            used: vec![0; num_blocks as usize],
             free_list,
         }
     }
@@ -106,8 +131,65 @@ impl BlockPool {
             !self.allocated[index as usize],
             "free list contained a live block"
         );
+        debug_assert_eq!(self.used[index as usize], 0, "free block still has tokens");
         self.allocated[index as usize] = true;
         Ok(BlockId(index))
+    }
+
+    /// Record how many token slots in `id` hold live KV data.
+    ///
+    /// `used` must be at most [`BlockPool::block_size`]. A freshly allocated
+    /// block starts at zero, which counts as a fully wasted block until the
+    /// caller fills it. Every owner of a block sees the same count.
+    pub fn set_used(&mut self, id: BlockId, used: u32) -> Result<(), AllocError> {
+        self.ensure_live(id)?;
+        if used > self.block_size {
+            return Err(AllocError::InvalidUsed {
+                block: id,
+                used,
+                block_size: self.block_size,
+            });
+        }
+        self.used[id.0 as usize] = used;
+        Ok(())
+    }
+
+    /// Initialized token slots in an allocated block.
+    pub fn used(&self, id: BlockId) -> Result<u32, AllocError> {
+        self.ensure_live(id)?;
+        Ok(self.used[id.0 as usize])
+    }
+
+    /// Token slots in allocated blocks that do not hold live KV data.
+    ///
+    /// Free blocks contribute nothing.
+    pub fn wasted_slots(&self) -> u64 {
+        self.allocated
+            .iter()
+            .zip(self.used.iter())
+            .filter(|(live, _)| **live)
+            .map(|(_, used)| u64::from(self.block_size - *used))
+            .sum()
+    }
+
+    /// `wasted_slots / (allocated blocks * block_size)`.
+    ///
+    /// This is internal fragmentation only. An empty pool reports `0.0`.
+    pub fn fragmentation(&self) -> f64 {
+        let allocated = u64::from(self.capacity() - self.free_count());
+        if allocated == 0 {
+            0.0
+        } else {
+            self.wasted_slots() as f64 / (allocated as f64 * f64::from(self.block_size))
+        }
+    }
+
+    fn ensure_live(&self, id: BlockId) -> Result<(), AllocError> {
+        match self.allocated.get(id.0 as usize) {
+            None => Err(AllocError::InvalidBlock(id)),
+            Some(false) => Err(AllocError::NotAllocated(id)),
+            Some(true) => Ok(()),
+        }
     }
 
     /// Return a block to the pool.
@@ -123,6 +205,7 @@ impl BlockPool {
             return Err(AllocError::NotAllocated(id));
         }
         *slot = false;
+        self.used[id.0 as usize] = 0;
         self.free_list.push(id.0);
         Ok(())
     }
@@ -205,5 +288,82 @@ mod tests {
         let mut pool = BlockPool::new(0, 4);
         assert_eq!(pool.free_count(), 0);
         assert_eq!(pool.allocate().unwrap_err(), AllocError::Exhausted);
+    }
+
+    #[test]
+    fn partial_block_reports_tail_waste() {
+        let mut pool = BlockPool::new(2, 16);
+        let id = pool.allocate().unwrap();
+        assert_eq!(pool.used(id).unwrap(), 0);
+        assert_eq!(pool.wasted_slots(), 16);
+
+        pool.set_used(id, 10).unwrap();
+        assert_eq!(pool.used(id).unwrap(), 10);
+        assert_eq!(pool.wasted_slots(), 6);
+        assert_eq!(pool.fragmentation(), 6.0 / 16.0);
+    }
+
+    #[test]
+    fn full_block_has_no_internal_fragmentation() {
+        let mut pool = BlockPool::new(1, 8);
+        let id = pool.allocate().unwrap();
+        pool.set_used(id, 8).unwrap();
+        assert_eq!(pool.wasted_slots(), 0);
+        assert_eq!(pool.fragmentation(), 0.0);
+    }
+
+    #[test]
+    fn freeing_a_partial_block_drops_its_waste() {
+        let mut pool = BlockPool::new(2, 8);
+        let first = pool.allocate().unwrap();
+        let second = pool.allocate().unwrap();
+        pool.set_used(first, 3).unwrap();
+        pool.set_used(second, 8).unwrap();
+        assert_eq!(pool.wasted_slots(), 5);
+
+        pool.free(first).unwrap();
+        assert_eq!(pool.wasted_slots(), 0);
+        assert_eq!(pool.fragmentation(), 0.0);
+
+        let reused = pool.allocate().unwrap();
+        assert_eq!(reused, first);
+        assert_eq!(pool.used(reused).unwrap(), 0);
+        assert_eq!(pool.wasted_slots(), 8);
+    }
+
+    #[test]
+    fn set_used_rejects_free_oversized_and_unknown_blocks() {
+        let mut pool = BlockPool::new(1, 4);
+        let id = pool.allocate().unwrap();
+        pool.free(id).unwrap();
+        assert_eq!(
+            pool.set_used(id, 1).unwrap_err(),
+            AllocError::NotAllocated(id)
+        );
+        assert_eq!(pool.used(id).unwrap_err(), AllocError::NotAllocated(id));
+
+        let live = pool.allocate().unwrap();
+        assert_eq!(
+            pool.set_used(live, 5).unwrap_err(),
+            AllocError::InvalidUsed {
+                block: live,
+                used: 5,
+                block_size: 4,
+            }
+        );
+        assert_eq!(pool.used(live).unwrap(), 0);
+
+        let bogus = BlockId(3);
+        assert_eq!(
+            pool.used(bogus).unwrap_err(),
+            AllocError::InvalidBlock(bogus)
+        );
+    }
+
+    #[test]
+    fn idle_pool_has_zero_fragmentation() {
+        let pool = BlockPool::new(4, 8);
+        assert_eq!(pool.wasted_slots(), 0);
+        assert_eq!(pool.fragmentation(), 0.0);
     }
 }
