@@ -41,6 +41,8 @@ pub enum AllocError {
         /// Width of every block in the pool.
         block_size: u32,
     },
+    /// The refcount would exceed `u32::MAX`.
+    RefcountOverflow(BlockId),
 }
 
 impl std::fmt::Display for AllocError {
@@ -57,6 +59,9 @@ impl std::fmt::Display for AllocError {
                 f,
                 "block {block} cannot hold {used} tokens (block size is {block_size})"
             ),
+            AllocError::RefcountOverflow(id) => {
+                write!(f, "refcount of block {id} overflowed")
+            }
         }
     }
 }
@@ -76,12 +81,16 @@ impl std::error::Error for AllocError {}
 /// Blocks are interchangeable, so a hole on the free list is not external
 /// fragmentation. The only waste is internal: allocated blocks whose
 /// initialized token count is below `block_size`. [`BlockPool::wasted_slots`]
-/// reports that tail.
+/// reports that tail once per physical block, not once per owner.
+///
+/// A block with a refcount above one is shared. Every owner observes the
+/// same initialized slots. [`BlockPool::free`] drops a single owner and
+/// recycles the block only at zero.
 #[derive(Debug)]
 pub struct BlockPool {
     block_size: u32,
-    /// `true` while the block is checked out.
-    allocated: Vec<bool>,
+    /// Live owners of each block. Zero means the id is on `free_list`.
+    refcounts: Vec<u32>,
     /// Initialized token slots in each block. Zero when the block is free.
     used: Vec<u32>,
     /// Free block indices. The next allocation pops the last entry.
@@ -101,7 +110,7 @@ impl BlockPool {
         }
         Self {
             block_size,
-            allocated: vec![false; num_blocks as usize],
+            refcounts: vec![0; num_blocks as usize],
             used: vec![0; num_blocks as usize],
             free_list,
         }
@@ -114,7 +123,7 @@ impl BlockPool {
 
     /// Total number of blocks in the pool, free and allocated.
     pub fn capacity(&self) -> u32 {
-        self.allocated.len() as u32
+        self.refcounts.len() as u32
     }
 
     /// Blocks that [`BlockPool::allocate`] can still hand out.
@@ -122,25 +131,51 @@ impl BlockPool {
         self.free_list.len() as u32
     }
 
-    /// Take one free block.
+    /// Take one free block and give it a refcount of one.
     ///
-    /// The caller uniquely owns the returned id until [`BlockPool::free`].
+    /// Copying the returned [`BlockId`] does not add an owner. Share the
+    /// block with [`BlockPool::acquire`].
     pub fn allocate(&mut self) -> Result<BlockId, AllocError> {
         let index = self.free_list.pop().ok_or(AllocError::Exhausted)?;
-        debug_assert!(
-            !self.allocated[index as usize],
+        debug_assert_eq!(
+            self.refcounts[index as usize], 0,
             "free list contained a live block"
         );
         debug_assert_eq!(self.used[index as usize], 0, "free block still has tokens");
-        self.allocated[index as usize] = true;
+        self.refcounts[index as usize] = 1;
         Ok(BlockId(index))
+    }
+
+    /// Add one owner to an allocated block.
+    ///
+    /// The new owner shares the block's current contents. Returns the new
+    /// refcount.
+    pub fn acquire(&mut self, id: BlockId) -> Result<u32, AllocError> {
+        let rc = self
+            .refcounts
+            .get_mut(id.0 as usize)
+            .ok_or(AllocError::InvalidBlock(id))?;
+        if *rc == 0 {
+            return Err(AllocError::NotAllocated(id));
+        }
+        let next = rc.checked_add(1).ok_or(AllocError::RefcountOverflow(id))?;
+        *rc = next;
+        Ok(next)
+    }
+
+    /// Owners of an in-range block. A free block reports zero.
+    pub fn refcount(&self, id: BlockId) -> Result<u32, AllocError> {
+        self.refcounts
+            .get(id.0 as usize)
+            .copied()
+            .ok_or(AllocError::InvalidBlock(id))
     }
 
     /// Record how many token slots in `id` hold live KV data.
     ///
     /// `used` must be at most [`BlockPool::block_size`]. A freshly allocated
     /// block starts at zero, which counts as a fully wasted block until the
-    /// caller fills it. Every owner of a block sees the same count.
+    /// caller fills it. Every owner of a shared block sees this same count.
     pub fn set_used(&mut self, id: BlockId, used: u32) -> Result<(), AllocError> {
         self.ensure_live(id)?;
         if used > self.block_size {
@@ -162,12 +197,12 @@ impl BlockPool {
 
     /// Token slots in allocated blocks that do not hold live KV data.
     ///
-    /// Free blocks contribute nothing.
+    /// Free blocks contribute nothing. A shared block is counted once.
     pub fn wasted_slots(&self) -> u64 {
-        self.allocated
+        self.refcounts
             .iter()
             .zip(self.used.iter())
-            .filter(|(live, _)| **live)
+            .filter(|(rc, _)| **rc > 0)
             .map(|(_, used)| u64::from(self.block_size - *used))
             .sum()
     }
@@ -185,28 +220,31 @@ impl BlockPool {
     }
 
     fn ensure_live(&self, id: BlockId) -> Result<(), AllocError> {
-        match self.allocated.get(id.0 as usize) {
+        match self.refcounts.get(id.0 as usize) {
             None => Err(AllocError::InvalidBlock(id)),
-            Some(false) => Err(AllocError::NotAllocated(id)),
-            Some(true) => Ok(()),
+            Some(0) => Err(AllocError::NotAllocated(id)),
+            Some(_) => Ok(()),
         }
     }
 
-    /// Return a block to the pool.
+    /// Drop one owner of a block.
     ///
-    /// The id must refer to a block this pool previously allocated and has
-    /// not yet freed. The freed id is pushed onto the free list.
+    /// The block returns to the free list only when its refcount reaches
+    /// zero. Until then the initialized-token count is left unchanged.
     pub fn free(&mut self, id: BlockId) -> Result<(), AllocError> {
-        let slot = self
-            .allocated
-            .get_mut(id.0 as usize)
+        let index = id.0 as usize;
+        let rc = self
+            .refcounts
+            .get_mut(index)
             .ok_or(AllocError::InvalidBlock(id))?;
-        if !*slot {
+        if *rc == 0 {
             return Err(AllocError::NotAllocated(id));
         }
-        *slot = false;
-        self.used[id.0 as usize] = 0;
-        self.free_list.push(id.0);
+        *rc -= 1;
+        if *rc == 0 {
+            self.used[index] = 0;
+            self.free_list.push(id.0);
+        }
         Ok(())
     }
 }
@@ -365,5 +403,56 @@ mod tests {
         let pool = BlockPool::new(4, 8);
         assert_eq!(pool.wasted_slots(), 0);
         assert_eq!(pool.fragmentation(), 0.0);
+    }
+
+    #[test]
+    fn shared_block_stays_live_until_the_last_owner_frees_it() {
+        let mut pool = BlockPool::new(1, 8);
+        let id = pool.allocate().unwrap();
+        pool.set_used(id, 8).unwrap();
+        assert_eq!(pool.acquire(id).unwrap(), 2);
+        assert_eq!(pool.refcount(id).unwrap(), 2);
+
+        pool.free(id).unwrap();
+        assert_eq!(pool.refcount(id).unwrap(), 1);
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.used(id).unwrap(), 8);
+
+        pool.free(id).unwrap();
+        assert_eq!(pool.refcount(id).unwrap(), 0);
+        assert_eq!(pool.free_count(), 1);
+        assert_eq!(pool.wasted_slots(), 0);
+        assert_eq!(pool.used(id).unwrap_err(), AllocError::NotAllocated(id));
+        assert_eq!(pool.free(id).unwrap_err(), AllocError::NotAllocated(id));
+    }
+
+    #[test]
+    fn acquire_rejects_a_free_or_unknown_block() {
+        let mut pool = BlockPool::new(1, 4);
+        let id = pool.allocate().unwrap();
+        pool.free(id).unwrap();
+        assert_eq!(pool.acquire(id).unwrap_err(), AllocError::NotAllocated(id));
+        assert_eq!(pool.free_count(), 1);
+
+        let bogus = BlockId(5);
+        assert_eq!(
+            pool.acquire(bogus).unwrap_err(),
+            AllocError::InvalidBlock(bogus)
+        );
+        assert_eq!(
+            pool.refcount(bogus).unwrap_err(),
+            AllocError::InvalidBlock(bogus)
+        );
+    }
+
+    #[test]
+    fn shared_owners_do_not_double_count_tail_waste() {
+        let mut pool = BlockPool::new(1, 16);
+        let id = pool.allocate().unwrap();
+        pool.set_used(id, 10).unwrap();
+        pool.acquire(id).unwrap();
+        assert_eq!(pool.refcount(id).unwrap(), 2);
+        assert_eq!(pool.wasted_slots(), 6);
+        assert_eq!(pool.fragmentation(), 6.0 / 16.0);
     }
 }
