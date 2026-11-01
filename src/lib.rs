@@ -85,7 +85,8 @@ impl std::error::Error for AllocError {}
 ///
 /// A block with a refcount above one is shared. Every owner observes the
 /// same initialized slots. [`BlockPool::free`] drops a single owner and
-/// recycles the block only at zero.
+/// recycles the block only at zero. [`BlockPool::cow`] forks a private
+/// block before a write that would diverge from the other owners.
 #[derive(Debug)]
 pub struct BlockPool {
     block_size: u32,
@@ -246,6 +247,33 @@ impl BlockPool {
             self.free_list.push(id.0);
         }
         Ok(())
+    }
+
+    /// Return a block the caller can write without aliasing other owners.
+    ///
+    /// A uniquely owned block is returned unchanged. A shared block is
+    /// forked: this allocates a new block, copies the initialized-slot
+    /// count onto it, and drops one reference to `id`. The pool does not
+    /// store KV bytes. When the returned id differs from `id`, the caller
+    /// copies those bytes.
+    ///
+    /// On failure the original refcount and used-slot count are unchanged.
+    pub fn cow(&mut self, id: BlockId) -> Result<BlockId, AllocError> {
+        let owners = self.refcount(id)?;
+        if owners == 0 {
+            return Err(AllocError::NotAllocated(id));
+        }
+        if owners == 1 {
+            return Ok(id);
+        }
+        let used = self.used(id)?;
+        let fresh = self.allocate()?;
+        if let Err(err) = self.set_used(fresh, used) {
+            let _ = self.free(fresh);
+            return Err(err);
+        }
+        self.free(id)?;
+        Ok(fresh)
     }
 }
 
@@ -454,5 +482,59 @@ mod tests {
         assert_eq!(pool.refcount(id).unwrap(), 2);
         assert_eq!(pool.wasted_slots(), 6);
         assert_eq!(pool.fragmentation(), 6.0 / 16.0);
+    }
+
+    #[test]
+    fn cow_keeps_a_unique_block_in_place() {
+        let mut pool = BlockPool::new(2, 8);
+        let id = pool.allocate().unwrap();
+        pool.set_used(id, 3).unwrap();
+        assert_eq!(pool.cow(id).unwrap(), id);
+        assert_eq!(pool.refcount(id).unwrap(), 1);
+        assert_eq!(pool.used(id).unwrap(), 3);
+        assert_eq!(pool.free_count(), 1);
+    }
+
+    #[test]
+    fn cow_forks_a_shared_block_without_changing_the_other_owner() {
+        let mut pool = BlockPool::new(2, 8);
+        let shared = pool.allocate().unwrap();
+        pool.set_used(shared, 5).unwrap();
+        pool.acquire(shared).unwrap();
+
+        let private = pool.cow(shared).unwrap();
+        assert_ne!(private, shared);
+        assert_eq!(pool.refcount(shared).unwrap(), 1);
+        assert_eq!(pool.refcount(private).unwrap(), 1);
+        assert_eq!(pool.used(shared).unwrap(), 5);
+        assert_eq!(pool.used(private).unwrap(), 5);
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.wasted_slots(), 6);
+
+        pool.set_used(private, 6).unwrap();
+        assert_eq!(pool.used(shared).unwrap(), 5);
+        assert_eq!(pool.used(private).unwrap(), 6);
+    }
+
+    #[test]
+    fn cow_of_a_shared_block_fails_cleanly_when_the_pool_is_full() {
+        let mut pool = BlockPool::new(1, 4);
+        let shared = pool.allocate().unwrap();
+        pool.set_used(shared, 4).unwrap();
+        pool.acquire(shared).unwrap();
+
+        assert_eq!(pool.cow(shared).unwrap_err(), AllocError::Exhausted);
+        assert_eq!(pool.refcount(shared).unwrap(), 2);
+        assert_eq!(pool.used(shared).unwrap(), 4);
+        assert_eq!(pool.free_count(), 0);
+    }
+
+    #[test]
+    fn cow_rejects_a_free_block() {
+        let mut pool = BlockPool::new(1, 4);
+        let id = pool.allocate().unwrap();
+        pool.free(id).unwrap();
+        assert_eq!(pool.cow(id).unwrap_err(), AllocError::NotAllocated(id));
+        assert_eq!(pool.free_count(), 1);
     }
 }
