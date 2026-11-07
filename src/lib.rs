@@ -1,7 +1,8 @@
 //! Paged KV-cache block management.
 //!
-//! The pool tracks fixed-size blocks for a key/value cache.
-//! Callers own the KV bytes and address them by block id.
+//! [`BlockPool`] tracks fixed-size blocks. [`BlockTable`] maps one sequence's
+//! tokens onto those blocks and can fork a shared prefix. Callers own the KV
+//! bytes and address them by [`BlockId`].
 
 /// Identifier of one block in a [`BlockPool`].
 ///
@@ -23,7 +24,7 @@ impl std::fmt::Display for BlockId {
     }
 }
 
-/// Failure from a block-pool operation.
+/// Failure from the block pool or a block table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllocError {
     /// Every block is currently allocated.
@@ -43,6 +44,20 @@ pub enum AllocError {
     },
     /// The refcount would exceed `u32::MAX`.
     RefcountOverflow(BlockId),
+    /// [`BlockTable::grow`] was asked to shorten the table.
+    LengthRegression {
+        /// Current logical token count.
+        current: u32,
+        /// Requested token count.
+        requested: u32,
+    },
+    /// A prefix was longer than the table it came from.
+    PrefixOutOfRange {
+        /// Requested prefix length, in tokens.
+        prefix_len: u32,
+        /// Logical token count of the source table.
+        len: u32,
+    },
 }
 
 impl std::fmt::Display for AllocError {
@@ -62,6 +77,14 @@ impl std::fmt::Display for AllocError {
             AllocError::RefcountOverflow(id) => {
                 write!(f, "refcount of block {id} overflowed")
             }
+            AllocError::LengthRegression { current, requested } => write!(
+                f,
+                "cannot shrink a block table from {current} tokens to {requested}"
+            ),
+            AllocError::PrefixOutOfRange { prefix_len, len } => write!(
+                f,
+                "prefix of {prefix_len} tokens exceeds the table length of {len}"
+            ),
         }
     }
 }
@@ -120,6 +143,17 @@ impl BlockPool {
     /// Tokens represented by one block.
     pub fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    /// Number of blocks required to hold `len` tokens of `block_size`.
+    ///
+    /// # Panics
+    /// Panics if `block_size` is zero.
+    pub fn blocks_needed(len: u32, block_size: u32) -> u32 {
+        assert!(block_size > 0, "block_size must be non-zero");
+        let len = u64::from(len);
+        let block_size = u64::from(block_size);
+        len.div_ceil(block_size) as u32
     }
 
     /// Total number of blocks in the pool, free and allocated.
@@ -274,6 +308,264 @@ impl BlockPool {
         }
         self.free(id)?;
         Ok(fresh)
+    }
+}
+
+/// Record of pool mutations made by one [`BlockTable::grow`], so a failed
+/// grow can put the pool back.
+enum GrowUndo {
+    Allocated(BlockId),
+    SetUsed { id: BlockId, prev: u32 },
+    Cow { previous: BlockId, private: BlockId },
+}
+
+/// Ordered blocks backing one sequence.
+///
+/// The table borrows a [`BlockPool`] only for the duration of a method.
+/// Each id it stores is one live reference. [`BlockTable::release`] drops
+/// those references. Dropping a table without releasing leaks them for the
+/// rest of the pool's life.
+///
+/// Blocks before the tail are full. The tail may be partial. Appending into
+/// a shared tail copy-on-writes that block. Appending past a full block
+/// allocates a new one, so a shared full block is never written in place.
+#[derive(Debug)]
+#[must_use = "call release to return block references to the pool"]
+pub struct BlockTable {
+    blocks: Vec<BlockId>,
+    len: u32,
+}
+
+impl Default for BlockTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockTable {
+    /// Empty table. It holds no block references.
+    pub fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// Logical tokens represented by this table.
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// `true` when the table covers no tokens.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Blocks in token order. Only the last block may be partially used.
+    pub fn blocks(&self) -> &[BlockId] {
+        &self.blocks
+    }
+
+    /// Grow the table until it covers `new_len` tokens.
+    ///
+    /// When `new_len` crosses a block boundary, this allocates a new block.
+    /// When the current tail is shared and the write extends into it, that
+    /// tail is copy-on-write first.
+    ///
+    /// A failure leaves this table and the pool as they were. Shortening is
+    /// rejected.
+    pub fn grow(&mut self, pool: &mut BlockPool, new_len: u32) -> Result<(), AllocError> {
+        if new_len < self.len {
+            return Err(AllocError::LengthRegression {
+                current: self.len,
+                requested: new_len,
+            });
+        }
+        if new_len == self.len {
+            return Ok(());
+        }
+
+        let block_size = pool.block_size();
+        let extra = BlockPool::blocks_needed(new_len, block_size)
+            - BlockPool::blocks_needed(self.len, block_size);
+        let mut cow_blocks: u32 = 0;
+        if !self.len.is_multiple_of(block_size) {
+            let tail = self.blocks[self.blocks.len() - 1];
+            if pool.refcount(tail)? > 1 {
+                cow_blocks = 1;
+            }
+        }
+        let needed = u64::from(extra) + u64::from(cow_blocks);
+        if u64::from(pool.free_count()) < needed {
+            return Err(AllocError::Exhausted);
+        }
+
+        let snap_len = self.len;
+        let snap_blocks = self.blocks.clone();
+        let mut undo = Vec::new();
+        while self.len < new_len {
+            if let Err(err) = self.append_one(pool, &mut undo) {
+                self.rollback_grow(pool, snap_len, snap_blocks, &mut undo);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn append_one(
+        &mut self,
+        pool: &mut BlockPool,
+        undo: &mut Vec<GrowUndo>,
+    ) -> Result<(), AllocError> {
+        let block_size = pool.block_size();
+        if self.len.is_multiple_of(block_size) {
+            let id = pool.allocate()?;
+            undo.push(GrowUndo::Allocated(id));
+            pool.set_used(id, 1)?;
+            self.blocks.push(id);
+            self.len += 1;
+            return Ok(());
+        }
+
+        let last = self.blocks.len() - 1;
+        let tail = self.blocks[last];
+        let used = pool.used(tail)?;
+        if used >= block_size {
+            return Err(AllocError::InvalidUsed {
+                block: tail,
+                used: used.saturating_add(1),
+                block_size,
+            });
+        }
+        if pool.refcount(tail)? > 1 {
+            let private = pool.cow(tail)?;
+            undo.push(GrowUndo::Cow {
+                previous: tail,
+                private,
+            });
+            self.blocks[last] = private;
+            pool.set_used(private, used + 1)?;
+            self.len += 1;
+            return Ok(());
+        }
+
+        undo.push(GrowUndo::SetUsed {
+            id: tail,
+            prev: used,
+        });
+        pool.set_used(tail, used + 1)?;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn rollback_grow(
+        &mut self,
+        pool: &mut BlockPool,
+        len: u32,
+        blocks: Vec<BlockId>,
+        undo: &mut Vec<GrowUndo>,
+    ) {
+        while let Some(op) = undo.pop() {
+            match op {
+                GrowUndo::Allocated(id) => {
+                    let _ = pool.free(id);
+                }
+                GrowUndo::SetUsed { id, prev } => {
+                    let _ = pool.set_used(id, prev);
+                }
+                GrowUndo::Cow { previous, private } => {
+                    let _ = pool.free(private);
+                    let _ = pool.acquire(previous);
+                }
+            }
+        }
+        self.len = len;
+        self.blocks = blocks;
+    }
+
+    /// Fork the first `prefix_len` tokens of this table.
+    ///
+    /// * A prefix that ends on a block boundary shares those full blocks.
+    /// * A prefix that covers this table's entire length also shares a
+    ///   partial tail. The next append copy-on-writes that tail.
+    /// * A prefix that ends inside a block the parent has already written
+    ///   past shares only the preceding full blocks. The child gets a new
+    ///   private block holding the partial prefix, so it does not alias the
+    ///   parent's later tokens.
+    ///
+    /// On failure, refcounts are unchanged and no new block stays allocated.
+    pub fn fork_prefix(&self, pool: &mut BlockPool, prefix_len: u32) -> Result<Self, AllocError> {
+        if prefix_len > self.len {
+            return Err(AllocError::PrefixOutOfRange {
+                prefix_len,
+                len: self.len,
+            });
+        }
+        if prefix_len == 0 {
+            return Ok(Self::new());
+        }
+
+        let block_size = pool.block_size();
+        let full_blocks = (prefix_len / block_size) as usize;
+        let remainder = prefix_len % block_size;
+        let share_partial = remainder > 0 && prefix_len == self.len;
+        let share_count = full_blocks + usize::from(share_partial);
+
+        let mut shared = Vec::with_capacity(share_count + usize::from(remainder > 0));
+        for slot in 0..share_count {
+            let id = self.blocks[slot];
+            if let Err(err) = pool.acquire(id) {
+                release_ids(pool, &shared);
+                return Err(err);
+            }
+            shared.push(id);
+        }
+
+        if remainder > 0 && !share_partial {
+            let id = match pool.allocate() {
+                Ok(id) => id,
+                Err(err) => {
+                    release_ids(pool, &shared);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = pool.set_used(id, remainder) {
+                let _ = pool.free(id);
+                release_ids(pool, &shared);
+                return Err(err);
+            }
+            shared.push(id);
+        }
+
+        Ok(Self {
+            blocks: shared,
+            len: prefix_len,
+        })
+    }
+
+    /// Drop one reference on every block in this table.
+    ///
+    /// Blocks that other tables still hold stay allocated. Later frees still
+    /// run if an earlier one fails, and the first error is returned.
+    pub fn release(self, pool: &mut BlockPool) -> Result<(), AllocError> {
+        let mut first_err = None;
+        for id in &self.blocks {
+            if let Err(err) = pool.free(*id) {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+fn release_ids(pool: &mut BlockPool, ids: &[BlockId]) {
+    for id in ids.iter().rev() {
+        let _ = pool.free(*id);
     }
 }
 
@@ -536,5 +828,191 @@ mod tests {
         pool.free(id).unwrap();
         assert_eq!(pool.cow(id).unwrap_err(), AllocError::NotAllocated(id));
         assert_eq!(pool.free_count(), 1);
+    }
+
+    #[test]
+    fn blocks_needed_rounds_up_a_partial_tail() {
+        assert_eq!(BlockPool::blocks_needed(0, 4), 0);
+        assert_eq!(BlockPool::blocks_needed(1, 4), 1);
+        assert_eq!(BlockPool::blocks_needed(4, 4), 1);
+        assert_eq!(BlockPool::blocks_needed(5, 4), 2);
+    }
+
+    #[test]
+    fn grow_fills_full_blocks_and_a_partial_tail() {
+        let mut pool = BlockPool::new(4, 4);
+        let mut table = BlockTable::new();
+        table.grow(&mut pool, 10).unwrap();
+        assert_eq!(table.len(), 10);
+        assert_eq!(table.blocks().len(), 3);
+        assert_eq!(pool.used(table.blocks()[0]).unwrap(), 4);
+        assert_eq!(pool.used(table.blocks()[1]).unwrap(), 4);
+        assert_eq!(pool.used(table.blocks()[2]).unwrap(), 2);
+        assert_eq!(pool.wasted_slots(), 2);
+        assert_eq!(pool.free_count(), 1);
+
+        table.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+        assert_eq!(pool.wasted_slots(), 0);
+    }
+
+    #[test]
+    fn fork_on_a_block_boundary_shares_only_the_covered_blocks() {
+        let mut pool = BlockPool::new(4, 4);
+        let mut parent = BlockTable::new();
+        parent.grow(&mut pool, 10).unwrap();
+        let child = parent.fork_prefix(&mut pool, 8).unwrap();
+
+        assert_eq!(child.len(), 8);
+        assert_eq!(child.blocks(), &parent.blocks()[..2]);
+        assert_eq!(pool.refcount(parent.blocks()[0]).unwrap(), 2);
+        assert_eq!(pool.refcount(parent.blocks()[1]).unwrap(), 2);
+        assert_eq!(pool.refcount(parent.blocks()[2]).unwrap(), 1);
+
+        let tail = parent.blocks()[2];
+        parent.grow(&mut pool, 11).unwrap();
+        assert_eq!(parent.blocks()[2], tail);
+        assert_eq!(pool.used(tail).unwrap(), 3);
+        assert_eq!(child.blocks().len(), 2);
+
+        child.release(&mut pool).unwrap();
+        parent.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+    }
+
+    #[test]
+    fn fork_of_the_whole_sequence_shares_the_tail_until_append() {
+        let mut pool = BlockPool::new(4, 4);
+        let mut parent = BlockTable::new();
+        parent.grow(&mut pool, 10).unwrap();
+        let tail = parent.blocks()[2];
+        let mut child = parent.fork_prefix(&mut pool, 10).unwrap();
+        assert_eq!(child.blocks(), parent.blocks());
+        assert_eq!(pool.refcount(tail).unwrap(), 2);
+
+        child.grow(&mut pool, 11).unwrap();
+        assert_eq!(child.len(), 11);
+        assert_ne!(child.blocks()[2], tail);
+        assert_eq!(parent.blocks()[2], tail);
+        assert_eq!(pool.refcount(tail).unwrap(), 1);
+        assert_eq!(pool.used(tail).unwrap(), 2);
+        assert_eq!(pool.used(child.blocks()[2]).unwrap(), 3);
+
+        child.release(&mut pool).unwrap();
+        parent.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+    }
+
+    #[test]
+    fn fork_inside_a_written_block_gets_a_private_boundary() {
+        let mut pool = BlockPool::new(4, 4);
+        let mut parent = BlockTable::new();
+        parent.grow(&mut pool, 10).unwrap();
+        let boundary = parent.blocks()[1];
+        let mut child = parent.fork_prefix(&mut pool, 6).unwrap();
+
+        assert_eq!(child.len(), 6);
+        assert_eq!(child.blocks().len(), 2);
+        assert_eq!(child.blocks()[0], parent.blocks()[0]);
+        assert_ne!(child.blocks()[1], boundary);
+        assert_eq!(pool.refcount(parent.blocks()[0]).unwrap(), 2);
+        assert_eq!(pool.refcount(boundary).unwrap(), 1);
+        assert_eq!(pool.used(boundary).unwrap(), 4);
+        assert_eq!(pool.used(child.blocks()[1]).unwrap(), 2);
+
+        child.grow(&mut pool, 7).unwrap();
+        assert_eq!(pool.used(child.blocks()[1]).unwrap(), 3);
+        assert_eq!(pool.used(boundary).unwrap(), 4);
+
+        child.release(&mut pool).unwrap();
+        parent.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+    }
+
+    #[test]
+    fn fork_rolls_back_acquires_when_the_private_block_cannot_be_allocated() {
+        let mut pool = BlockPool::new(3, 4);
+        let mut parent = BlockTable::new();
+        parent.grow(&mut pool, 10).unwrap();
+        assert_eq!(pool.free_count(), 0);
+
+        let err = parent.fork_prefix(&mut pool, 6).unwrap_err();
+        assert_eq!(err, AllocError::Exhausted);
+        assert_eq!(pool.refcount(parent.blocks()[0]).unwrap(), 1);
+        assert_eq!(pool.refcount(parent.blocks()[1]).unwrap(), 1);
+        assert_eq!(pool.free_count(), 0);
+
+        parent.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+    }
+
+    #[test]
+    fn extending_a_shared_tail_fails_cleanly_when_cow_cannot_allocate() {
+        let mut pool = BlockPool::new(3, 4);
+        let mut parent = BlockTable::new();
+        parent.grow(&mut pool, 10).unwrap();
+        let mut child = parent.fork_prefix(&mut pool, 10).unwrap();
+        let tail = parent.blocks()[2];
+        assert_eq!(pool.free_count(), 0);
+
+        assert_eq!(
+            child.grow(&mut pool, 11).unwrap_err(),
+            AllocError::Exhausted
+        );
+        assert_eq!(child.len(), 10);
+        assert_eq!(child.blocks()[2], tail);
+        assert_eq!(pool.refcount(tail).unwrap(), 2);
+        assert_eq!(pool.used(tail).unwrap(), 2);
+
+        child.release(&mut pool).unwrap();
+        parent.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+    }
+
+    #[test]
+    fn empty_and_overlong_prefixes_do_not_change_refcounts() {
+        let mut pool = BlockPool::new(2, 4);
+        let mut parent = BlockTable::new();
+        parent.grow(&mut pool, 4).unwrap();
+
+        let child = parent.fork_prefix(&mut pool, 0).unwrap();
+        assert!(child.is_empty());
+        child.release(&mut pool).unwrap();
+        assert_eq!(pool.refcount(parent.blocks()[0]).unwrap(), 1);
+
+        assert_eq!(
+            parent.fork_prefix(&mut pool, 5).unwrap_err(),
+            AllocError::PrefixOutOfRange {
+                prefix_len: 5,
+                len: 4,
+            }
+        );
+        assert_eq!(pool.free_count(), 1);
+        parent.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
+    }
+
+    #[test]
+    fn grow_rejects_a_shorter_length_and_an_allocation_it_cannot_finish() {
+        let mut pool = BlockPool::new(1, 4);
+        let mut table = BlockTable::new();
+        assert_eq!(table.grow(&mut pool, 8).unwrap_err(), AllocError::Exhausted);
+        assert!(table.is_empty());
+        assert_eq!(pool.free_count(), 1);
+
+        table.grow(&mut pool, 3).unwrap();
+        assert_eq!(
+            table.grow(&mut pool, 1).unwrap_err(),
+            AllocError::LengthRegression {
+                current: 3,
+                requested: 1,
+            }
+        );
+        assert_eq!(table.len(), 3);
+        table.grow(&mut pool, 3).unwrap();
+        assert_eq!(table.blocks().len(), 1);
+
+        table.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
     }
 }
