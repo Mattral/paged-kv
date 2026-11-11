@@ -1,26 +1,51 @@
 # paged-kv
 
-A Rust block pool for a paged KV cache. It tracks which fixed-size blocks are free, which are shared, and how a sequence's tokens map onto them.
+A Rust block pool for a paged KV cache, and a first-come, first-served continuous batcher.
 
-The pool does not store tensors. The caller owns the KV bytes and addresses them with a `BlockId`.
+The pool does not store tensors. The caller owns the KV bytes and addresses them with a `BlockId`. The scheduler does not run a model. It queues sequences, reserves prompt blocks, appends one fake decode token at a time, and retires finished sequences.
 
-This is v0.1: the block manager only. There is no scheduler, no benchmark, and no Python binding.
+## Measured bookkeeping
+
+`cargo bench --bench scheduler_overhead` times the scheduler against a loop that runs the same prompts and decode tokens one sequence at a time. Both paths allocate through the paged pool. This is not a comparison with contiguous KV storage, and it is not model throughput.
+
+Workload: 256 sequences, 128 prompt tokens, 64 generated tokens, block size 16, batch size 16. The pool has 192 blocks, enough for one full batch. Release build, 3 warmup iterations, then the median of 21. Host: Linux 6.18.58.1-microsoft-standard-WSL2, x86_64, rustc 1.99.1.
+
+| Path | min | median | max |
+| --- | --- | --- | --- |
+| Naive per-sequence loop | 0.824 ms | 0.836 ms | 1.021 ms |
+| Scheduler | 1.148 ms | 1.207 ms | 1.554 ms |
+
+The median ratio of scheduler to naive is 1.44. In this run every scheduler sample was slower than every naive sample. Two earlier runs of the same benchmark on this host had median ratios of 1.38 and 1.38. The scheduler keeps 16 sequences live and maintains a waiting queue. The naive loop finishes one sequence before it starts the next. On this metadata-only workload, that queue costs more than it saves.
 
 ## What works
 
-`BlockPool` allocates fixed-size blocks, recycles them from an explicit free list, counts reference-counted owners, and copy-on-writes a shared block when one owner must diverge. `BlockTable` grows a sequence and forks a prefix under those rules.
+- `BlockPool` allocates fixed-size blocks, recycles them from a free list, counts owners, and copy-on-writes a shared block.
+- `BlockTable` maps a token length onto blocks and can fork a prefix.
+- `Sequence` splits that length into prompt tokens and generated tokens (`prompt_and_generated_tokens_share_one_table`).
+- `Scheduler` admits in arrival order, steps the batch, and retires finished sequences (`step_then_retire_frees_blocks_and_admits_the_next_sequence`, `fake_generation_joins_sequences_and_frees_every_block`).
 
-`cargo test` covers that behavior. The claims below name the tests that lock them.
+`cargo test` covers the behavior named below.
 
-## What does not work
+## What this is not
 
-- No continuous batching scheduler, and no sequence queue.
-- No measured allocation or scheduling numbers. Nothing here is a performance claim.
-- No KV tensor storage, attention kernel, or model runner.
+- No model, tokenizer, attention kernel, or KV tensor copy.
 - No Python bindings.
-- No preemption hook, prefix-hit metric, or multi-device cache.
+- No preemption, and no priority other than arrival order.
+- The scheduler does not share prefixes. `BlockTable::fork_prefix` can, and admission does not call it.
+- No chunked prefill. Admission reserves the whole prompt at once.
+- A prompt that does not fit is not skipped. Smaller requests behind it wait (`a_prompt_that_does_not_fit_blocks_smaller_requests_behind_it`).
+- A finished sequence keeps its batch slot until `retire` (`a_finished_sequence_keeps_its_slot_until_retire`).
+- `step` grows every decoding sequence or none of them (`step_is_all_or_nothing_when_the_batch_cannot_grow`).
+- The benchmark above does not say whether paging is faster than one contiguous buffer per sequence.
+- No multi-device cache.
 
-Dropping a `BlockTable` without `release` leaks block references until the pool is dropped. The type is marked `must_use`, and the tests call `release`.
+Dropping a `BlockTable` or a `Sequence` that holds blocks, without `release`, leaks those references until the pool is dropped. The table type is marked `must_use`. The tests release what they allocate.
+
+## Scheduler
+
+Admission is first-come, first-served. Arrival order is the admission order, which keeps the queue testable. There is no priority heap.
+
+`add` enqueues a prompt length and a decode budget. It does not allocate. `admit` reserves blocks for the oldest waiting prompt while the batch has a free slot and the prompt fits (`admission_follows_arrival_order_and_stops_at_the_batch_size`). `step` appends one generated token to each decoding sequence. `retire` returns finished blocks to the pool. A request with `max_new_tokens == 0` finishes as soon as its prompt is reserved (`zero_new_tokens_finishes_when_the_prompt_is_reserved`).
 
 ## Memory layout
 
@@ -78,10 +103,11 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 }
 ```
 
-## Tests
+## Tests and the benchmark
 
 ```sh
 cargo test
+cargo bench --bench scheduler_overhead
 ```
 
-v0.1 stops at this block manager. Scheduler behavior and any comparison against a non-paged baseline are later work, and they are not claimed here.
+The benchmark prints nanoseconds. The table above is one release run on the host named in Measured bookkeeping. A non-paged baseline is not in this crate yet.
