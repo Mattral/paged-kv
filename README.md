@@ -6,16 +6,20 @@ The pool does not store tensors. The caller owns the KV bytes and addresses them
 
 ## Measured bookkeeping
 
-`cargo bench --bench scheduler_overhead` times the scheduler against a loop that runs the same prompts and decode tokens one sequence at a time. Both paths allocate through the paged pool. This is not a comparison with contiguous KV storage, and it is not model throughput.
+`cargo bench --bench scheduler_overhead` times the scheduler against a loop that runs the same prompts and decode tokens one sequence at a time. Both paths use the paged pool. This is not model throughput, and it is not a comparison with contiguous KV storage.
 
-Workload: 256 sequences, 128 prompt tokens, 64 generated tokens, block size 16, batch size 16. The pool has 192 blocks, enough for one full batch. Release build, 3 warmup iterations, then the median of 21. Host: Linux 6.18.58.1-microsoft-standard-WSL2, x86_64, rustc 1.99.1.
+![The scheduler bar is longer, and its whole range sits to the right of the slowest one-sequence run](docs/scheduler-overhead.svg)
+
+256 sequences, 128 prompt tokens, 64 generated tokens, block size 16, batch of 16, pool of 192 blocks. Release build on Linux WSL2 x86_64, rustc 1.99.1. Three warmup iterations, then 21 timed runs.
+
+The scheduler median is 1.44× the one-sequence loop. The queue keeps 16 sequences live. The other loop finishes one sequence before the next. On this metadata-only workload, that bookkeeping costs more than it saves. Two earlier runs on this host were 1.38× and 1.38×.
+
+The chart is drawn from this run:
 
 | Path | min | median | max |
 | --- | --- | --- | --- |
-| Naive per-sequence loop | 0.824 ms | 0.836 ms | 1.021 ms |
-| Scheduler | 1.148 ms | 1.207 ms | 1.554 ms |
-
-The median ratio of scheduler to naive is 1.44. In this run every scheduler sample was slower than every naive sample. Two earlier runs of the same benchmark on this host had median ratios of 1.38 and 1.38. The scheduler keeps 16 sequences live and maintains a waiting queue. The naive loop finishes one sequence before it starts the next. On this metadata-only workload, that queue costs more than it saves.
+| One sequence at a time | 0.824 ms | 0.836 ms | 1.021 ms |
+| Scheduler, batch of 16 | 1.148 ms | 1.207 ms | 1.554 ms |
 
 ## What works
 

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" role="img">
+  <title>Scheduler bookkeeping is slower than a one-sequence loop</title>
+  <desc>Bars are medians of 21 runs. Whiskers run from the fastest to the slowest run. One-sequence loop: median 0.836 ms, range 0.824 to 1.021 ms. Scheduler: median 1.207 ms, range 1.148 to 1.554 ms. The dashed line marks the slowest one-sequence run. Every scheduler run is to the right of it.</desc>
+  <rect width="760" height="300" rx="12" fill="#ffffff" stroke="#e6e8ee"/>
+  <text x="32" y="36" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="600">Same tokens, more queue overhead</text>
+  <text x="32" y="58" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Bar is the median. Whisker runs from the fastest to the slowest of 21 runs.</text>
+
+  <!-- 0 ms at x=32, 1.8 ms at x=720 -->
+  <line x1="422.2" y1="84" x2="422.2" y2="214" stroke="#c4c9d1" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <text x="32" y="98" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">One sequence at a time</text>
+  <rect x="32" y="108" width="688" height="28" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="108" width="319.5" height="28" rx="4" fill="#4c78a8"/>
+  <line x1="347" y1="122" x2="422.2" y2="122" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="347" y1="114" x2="347" y2="130" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="422.2" y1="114" x2="422.2" y2="130" stroke="#1a1a1a" stroke-width="2"/>
+  <text x="432" y="128" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">0.84 ms</text>
+
+  <text x="32" y="164" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Scheduler, batch of 16</text>
+  <rect x="32" y="174" width="688" height="28" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="174" width="461.3" height="28" rx="4" fill="#e45756"/>
+  <line x1="470.8" y1="188" x2="626" y2="188" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="470.8" y1="180" x2="470.8" y2="196" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="626" y1="180" x2="626" y2="196" stroke="#1a1a1a" stroke-width="2"/>
+  <text x="636" y="194" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">1.21 ms</text>
+
+  <g fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+    <line x1="32" y1="214" x2="720" y2="214" stroke="#d5d9e0"/>
+    <line x1="32" y1="214" x2="32" y2="220" stroke="#8b93a0"/>
+    <line x1="223.1" y1="214" x2="223.1" y2="220" stroke="#8b93a0"/>
+    <line x1="414.2" y1="214" x2="414.2" y2="220" stroke="#8b93a0"/>
+    <line x1="605.3" y1="214" x2="605.3" y2="220" stroke="#8b93a0"/>
+    <text x="32" y="238" text-anchor="middle">0</text>
+    <text x="223.1" y="238" text-anchor="middle">0.5</text>
+    <text x="414.2" y="238" text-anchor="middle">1.0</text>
+    <text x="605.3" y="238" text-anchor="middle">1.5 ms</text>
+  </g>
+  <text x="32" y="272" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Dashed line: slowest one-sequence run (1.02 ms). Every scheduler run sits to its right.</text>
+</svg>
