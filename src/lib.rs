@@ -4,6 +4,10 @@
 //! tokens onto those blocks and can fork a shared prefix. Callers own the KV
 //! bytes and address them by [`BlockId`].
 
+mod sequence;
+
+pub use sequence::{Phase, Sequence, SequenceId};
+
 /// Identifier of one block in a [`BlockPool`].
 ///
 /// Ids are local to the pool that issued them. Copying an id does not
