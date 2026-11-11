@@ -1,11 +1,15 @@
 //! Paged KV-cache block management.
 //!
 //! [`BlockPool`] tracks fixed-size blocks. [`BlockTable`] maps one sequence's
-//! tokens onto those blocks and can fork a shared prefix. Callers own the KV
-//! bytes and address them by [`BlockId`].
+//! tokens onto those blocks and can fork a shared prefix. [`Scheduler`]
+//! admits sequences first-come, first-served and retires them when their
+//! token budget is spent. Callers own the KV bytes and address them by
+//! [`BlockId`].
 
+mod scheduler;
 mod sequence;
 
+pub use scheduler::{DecodeStep, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
 
 /// Identifier of one block in a [`BlockPool`].
