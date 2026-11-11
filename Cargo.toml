@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Paged KV-cache block pool with prefix sharing"
 readme = "README.md"
+
+[[bench]]
+name = "scheduler_overhead"
+harness = false
