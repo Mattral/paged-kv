@@ -6,8 +6,9 @@
 //! [`Scheduler`] admits sequences first-come, first-served, retires them
 //! when their token budget is spent, and can preempt the newest decoding
 //! sequence when the caller asks. [`ContiguousTable`] is the non-paged
-//! baseline: one length and one capacity, with no blocks. Callers own the
-//! KV bytes and address paged storage by [`BlockId`].
+//! baseline: one length and one capacity, with no blocks. [`BlockPool::new`]
+//! tracks ids only. [`BlockPool::with_storage`] also keeps one `f32` vector
+//! per token slot, addressed by [`BlockId`].
 
 mod contiguous;
 mod prefix_cache;
@@ -73,6 +74,21 @@ pub enum AllocError {
         /// Logical token count of the source table.
         len: u32,
     },
+    /// [`BlockPool::kv`] was used on a pool built with [`BlockPool::new`].
+    NoStorage,
+    /// The token slot is outside the block.
+    InvalidSlot {
+        /// Block the caller addressed.
+        block: BlockId,
+        /// Slot inside that block.
+        slot: u32,
+        /// Width of every block in the pool.
+        block_size: u32,
+    },
+    /// A write was aimed at a block another owner still holds.
+    ///
+    /// Copy the block with [`BlockPool::cow`] and write the new id.
+    SharedWrite(BlockId),
 }
 
 impl std::fmt::Display for AllocError {
@@ -100,6 +116,18 @@ impl std::fmt::Display for AllocError {
                 f,
                 "prefix of {prefix_len} tokens exceeds the table length of {len}"
             ),
+            AllocError::NoStorage => write!(f, "this pool holds no kv vectors"),
+            AllocError::InvalidSlot {
+                block,
+                slot,
+                block_size,
+            } => write!(
+                f,
+                "block {block} has no slot {slot} (block size is {block_size})"
+            ),
+            AllocError::SharedWrite(id) => {
+                write!(f, "block {id} is shared; copy it before writing kv")
+            }
         }
     }
 }
@@ -108,8 +136,10 @@ impl std::error::Error for AllocError {}
 
 /// Pool of fixed-size KV-cache blocks.
 ///
-/// Each block stands for `block_size` token slots. This type owns allocation
-/// metadata only. KV tensors live with the caller, keyed by [`BlockId`].
+/// Each block stands for `block_size` token slots. [`BlockPool::new`] stores
+/// only allocation metadata. [`BlockPool::with_storage`] also stores one
+/// `f32` vector in every token slot. A model forward pass writes that vector
+/// through [`BlockPool::kv_mut`].
 ///
 /// Free ids live on an explicit stack. [`BlockPool::allocate`] pops that
 /// stack, so the block just released is the next one handed out. A fresh
@@ -134,6 +164,14 @@ pub struct BlockPool {
     used: Vec<u32>,
     /// Free block indices. The next allocation pops the last entry.
     free_list: Vec<u32>,
+    /// `f32` KV vectors, present only for [`BlockPool::with_storage`].
+    kv: Option<KvSlab>,
+}
+
+#[derive(Debug)]
+struct KvSlab {
+    floats_per_token: u32,
+    data: Vec<f32>,
 }
 
 impl BlockPool {
@@ -152,7 +190,36 @@ impl BlockPool {
             refcounts: vec![0; num_blocks as usize],
             used: vec![0; num_blocks as usize],
             free_list,
+            kv: None,
         }
+    }
+
+    /// Pool that stores an `f32` vector in every token slot.
+    ///
+    /// `floats_per_token` is the width of that vector. A block holds
+    /// `block_size` of them, packed in slot order. Fresh slots are zero.
+    /// Freeing the last owner zeroes the block again.
+    ///
+    /// # Panics
+    /// Panics if `block_size` or `floats_per_token` is zero, or if the slab
+    /// does not fit in memory.
+    pub fn with_storage(num_blocks: u32, block_size: u32, floats_per_token: u32) -> Self {
+        assert!(floats_per_token > 0, "floats_per_token must be non-zero");
+        let mut pool = Self::new(num_blocks, block_size);
+        let cells = (num_blocks as usize)
+            .checked_mul(block_size as usize)
+            .and_then(|n| n.checked_mul(floats_per_token as usize))
+            .expect("kv slab fits in memory");
+        pool.kv = Some(KvSlab {
+            floats_per_token,
+            data: vec![0.0; cells],
+        });
+        pool
+    }
+
+    /// Width of each stored token vector, if this pool has one.
+    pub fn floats_per_token(&self) -> Option<u32> {
+        self.kv.as_ref().map(|kv| kv.floats_per_token)
     }
 
     /// Tokens represented by one block.
@@ -280,7 +347,8 @@ impl BlockPool {
     /// Drop one owner of a block.
     ///
     /// The block returns to the free list only when its refcount reaches
-    /// zero. Until then the initialized-token count is left unchanged.
+    /// zero. Until then the initialized-token count and any stored KV
+    /// vectors are left unchanged. At zero the vectors are cleared.
     pub fn free(&mut self, id: BlockId) -> Result<(), AllocError> {
         let index = id.0 as usize;
         let rc = self
@@ -291,8 +359,10 @@ impl BlockPool {
             return Err(AllocError::NotAllocated(id));
         }
         *rc -= 1;
-        if *rc == 0 {
+        let dead = *rc == 0;
+        if dead {
             self.used[index] = 0;
+            self.zero_block(index);
             self.free_list.push(id.0);
         }
         Ok(())
@@ -302,11 +372,11 @@ impl BlockPool {
     ///
     /// A uniquely owned block is returned unchanged. A shared block is
     /// forked: this allocates a new block, copies the initialized-slot
-    /// count onto it, and drops one reference to `id`. The pool does not
-    /// store KV bytes. When the returned id differs from `id`, the caller
-    /// copies those bytes.
+    /// count onto it, copies any stored KV vectors for those slots, and
+    /// drops one reference to `id`.
     ///
-    /// On failure the original refcount and used-slot count are unchanged.
+    /// On failure the original refcount, used-slot count, and KV vectors
+    /// are unchanged.
     pub fn cow(&mut self, id: BlockId) -> Result<BlockId, AllocError> {
         let owners = self.refcount(id)?;
         if owners == 0 {
@@ -321,8 +391,71 @@ impl BlockPool {
             let _ = self.free(fresh);
             return Err(err);
         }
+        if let Err(err) = self.copy_kv(id, fresh, used) {
+            let _ = self.free(fresh);
+            return Err(err);
+        }
         self.free(id)?;
         Ok(fresh)
+    }
+
+    /// Borrow the `f32` vector stored for one token slot.
+    pub fn kv(&self, id: BlockId, slot: u32) -> Result<&[f32], AllocError> {
+        let range = self.kv_range(id, slot)?;
+        Ok(&self.kv.as_ref().expect("range requires storage").data[range])
+    }
+
+    /// Borrow the `f32` vector for a token slot this caller alone owns.
+    ///
+    /// A shared block returns [`AllocError::SharedWrite`]. Copy it with
+    /// [`BlockPool::cow`] and write the new id.
+    pub fn kv_mut(&mut self, id: BlockId, slot: u32) -> Result<&mut [f32], AllocError> {
+        if self.refcount(id)? > 1 {
+            return Err(AllocError::SharedWrite(id));
+        }
+        let range = self.kv_range(id, slot)?;
+        Ok(&mut self.kv.as_mut().expect("range requires storage").data[range])
+    }
+
+    fn kv_range(&self, id: BlockId, slot: u32) -> Result<std::ops::Range<usize>, AllocError> {
+        self.ensure_live(id)?;
+        let Some(kv) = &self.kv else {
+            return Err(AllocError::NoStorage);
+        };
+        if slot >= self.block_size {
+            return Err(AllocError::InvalidSlot {
+                block: id,
+                slot,
+                block_size: self.block_size,
+            });
+        }
+        let width = kv.floats_per_token as usize;
+        let start = (id.0 as usize * self.block_size as usize + slot as usize) * width;
+        Ok(start..start + width)
+    }
+
+    fn zero_block(&mut self, index: usize) {
+        let Some(kv) = self.kv.as_mut() else {
+            return;
+        };
+        let width = self.block_size as usize * kv.floats_per_token as usize;
+        let start = index * width;
+        kv.data[start..start + width].fill(0.0);
+    }
+
+    fn copy_kv(&mut self, from: BlockId, to: BlockId, slots: u32) -> Result<(), AllocError> {
+        if self.kv.is_none() || slots == 0 {
+            return Ok(());
+        }
+        let width = self.kv.as_ref().expect("checked").floats_per_token as usize;
+        let block = self.block_size as usize * width;
+        let count = slots as usize * width;
+        let src = from.0 as usize * block;
+        let dst = to.0 as usize * block;
+        let data = &mut self.kv.as_mut().expect("checked").data;
+        let copied = data[src..src + count].to_vec();
+        data[dst..dst + count].copy_from_slice(&copied);
+        Ok(())
     }
 }
 
@@ -834,6 +967,69 @@ mod tests {
         assert_eq!(pool.refcount(shared).unwrap(), 2);
         assert_eq!(pool.used(shared).unwrap(), 4);
         assert_eq!(pool.free_count(), 0);
+    }
+
+    #[test]
+    fn stored_kv_is_writable_until_the_block_is_freed() {
+        let mut pool = BlockPool::with_storage(2, 4, 3);
+        assert_eq!(pool.floats_per_token(), Some(3));
+        let id = pool.allocate().unwrap();
+        pool.kv_mut(id, 1)
+            .unwrap()
+            .copy_from_slice(&[1.0, 2.0, 3.0]);
+        assert_eq!(pool.kv(id, 1).unwrap(), &[1.0, 2.0, 3.0]);
+        assert_eq!(pool.kv(id, 0).unwrap(), &[0.0, 0.0, 0.0]);
+
+        pool.free(id).unwrap();
+        let again = pool.allocate().unwrap();
+        assert_eq!(again, id);
+        assert_eq!(pool.kv(again, 1).unwrap(), &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_metadata_pool_has_no_kv_vectors() {
+        let mut pool = BlockPool::new(1, 4);
+        let id = pool.allocate().unwrap();
+        assert_eq!(pool.floats_per_token(), None);
+        assert_eq!(pool.kv(id, 0).unwrap_err(), AllocError::NoStorage);
+        assert_eq!(pool.kv_mut(id, 0).unwrap_err(), AllocError::NoStorage);
+    }
+
+    #[test]
+    fn kv_rejects_a_slot_past_the_block_and_a_shared_write() {
+        let mut pool = BlockPool::with_storage(1, 4, 2);
+        let id = pool.allocate().unwrap();
+        assert_eq!(
+            pool.kv(id, 4).unwrap_err(),
+            AllocError::InvalidSlot {
+                block: id,
+                slot: 4,
+                block_size: 4,
+            }
+        );
+        pool.acquire(id).unwrap();
+        assert_eq!(pool.kv_mut(id, 0).unwrap_err(), AllocError::SharedWrite(id));
+        assert_eq!(pool.kv(id, 0).unwrap(), &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn cow_copies_stored_kv_and_leaves_the_other_owner_unchanged() {
+        let mut pool = BlockPool::with_storage(2, 4, 2);
+        let shared = pool.allocate().unwrap();
+        pool.set_used(shared, 1).unwrap();
+        pool.kv_mut(shared, 0).unwrap().copy_from_slice(&[4.0, 5.0]);
+        pool.acquire(shared).unwrap();
+
+        let private = pool.cow(shared).unwrap();
+        assert_eq!(pool.kv(shared, 0).unwrap(), &[4.0, 5.0]);
+        assert_eq!(pool.kv(private, 0).unwrap(), &[4.0, 5.0]);
+        assert_eq!(pool.kv(private, 1).unwrap(), &[0.0, 0.0]);
+
+        pool.kv_mut(private, 0)
+            .unwrap()
+            .copy_from_slice(&[9.0, 8.0]);
+        assert_eq!(pool.kv(shared, 0).unwrap(), &[4.0, 5.0]);
+        assert_eq!(pool.kv(private, 0).unwrap(), &[9.0, 8.0]);
     }
 
     #[test]
