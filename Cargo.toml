@@ -5,6 +5,10 @@ edition = "2021"
 description = "Paged KV-cache blocks, FCFS batching, and a contiguous baseline"
 readme = "README.md"
 
+[workspace]
+members = [".", "paged-kv-py"]
+resolver = "2"
+
 [[bench]]
 name = "scheduler_overhead"
 harness = false
