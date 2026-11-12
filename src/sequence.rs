@@ -40,6 +40,12 @@ pub enum Phase {
     Decoding,
     /// The token budget is spent. Blocks stay reserved until the owner releases them.
     Finished,
+    /// Out of the batch, with its blocks and generated tokens kept.
+    ///
+    /// [`crate::Scheduler::preempt`] with [`crate::PreemptPolicy::Pause`]
+    /// enters this phase. The next admission resumes decode without
+    /// reserving the prompt again.
+    Paused,
 }
 
 /// Prompt tokens plus generated tokens for one request.
@@ -155,6 +161,32 @@ impl Sequence {
     /// Drop this sequence's block references.
     pub fn release(self, pool: &mut BlockPool) -> Result<(), AllocError> {
         self.table.release(pool)
+    }
+
+    pub(crate) fn pause(&mut self) {
+        debug_assert_eq!(self.phase, Phase::Decoding);
+        self.phase = Phase::Paused;
+    }
+
+    pub(crate) fn resume(&mut self) {
+        debug_assert_eq!(self.phase, Phase::Paused);
+        self.phase = Phase::Decoding;
+    }
+
+    /// Free this sequence's blocks and forget generated tokens.
+    ///
+    /// The sequence is [`Phase::Waiting`] afterwards. If releasing a block
+    /// fails, the table is still gone and the phase is still waiting.
+    pub(crate) fn discard_progress(&mut self, pool: &mut BlockPool) -> Result<(), AllocError> {
+        debug_assert!(matches!(
+            self.phase,
+            Phase::Decoding | Phase::Paused | Phase::Finished
+        ));
+        let table = std::mem::take(&mut self.table);
+        let released = table.release(pool);
+        self.generated = 0;
+        self.phase = Phase::Waiting;
+        released
     }
 }
 

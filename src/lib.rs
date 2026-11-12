@@ -3,8 +3,9 @@
 //! [`BlockPool`] tracks fixed-size blocks. [`BlockTable`] maps one sequence's
 //! tokens onto those blocks and can fork a shared prefix. [`PrefixCache`]
 //! stores those forks under a caller-supplied key and counts hits.
-//! [`Scheduler`] admits sequences first-come, first-served and retires them
-//! when their token budget is spent. [`ContiguousTable`] is the non-paged
+//! [`Scheduler`] admits sequences first-come, first-served, retires them
+//! when their token budget is spent, and can preempt the newest decoding
+//! sequence when the caller asks. [`ContiguousTable`] is the non-paged
 //! baseline: one length and one capacity, with no blocks. Callers own the
 //! KV bytes and address paged storage by [`BlockId`].
 
@@ -15,7 +16,7 @@ mod sequence;
 
 pub use contiguous::ContiguousTable;
 pub use prefix_cache::PrefixCache;
-pub use scheduler::{DecodeStep, Scheduler};
+pub use scheduler::{DecodeStep, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
 
 /// Identifier of one block in a [`BlockPool`].

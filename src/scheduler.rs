@@ -10,13 +10,56 @@
 //! their batch slot until [`Scheduler::retire`] releases their blocks.
 //!
 //! The scheduler does not share prefixes across sequences. Prompt tokens are
-//! reserved in full at admission. There is no chunked prefill and no
-//! preemption.
+//! reserved in full at admission. There is no chunked prefill. Preemption is
+//! a caller hook: [`Scheduler::preempt`] removes the newest decoding
+//! sequence. Admission never preempts on its own.
 
 use std::collections::VecDeque;
 
 use crate::sequence::{Phase, Sequence, SequenceId};
 use crate::{AllocError, BlockPool};
+
+/// What happens to a sequence taken out of the batch by [`Scheduler::preempt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreemptPolicy {
+    /// Free its blocks and discard generated tokens.
+    ///
+    /// It waits again and will be prefilled from scratch. This is the policy
+    /// that returns memory to the pool.
+    Recompute,
+    /// Keep its blocks and its generated tokens.
+    ///
+    /// It waits outside the batch. The next time it is admitted, decode
+    /// continues. This frees a batch slot and does not free pool memory.
+    Pause,
+}
+
+/// [`Scheduler::preempt`] could not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreemptError {
+    /// The batch has no sequence that is still decoding.
+    NothingRunning,
+    /// Recompute failed while releasing blocks.
+    Alloc(AllocError),
+}
+
+impl std::fmt::Display for PreemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreemptError::NothingRunning => write!(f, "no decoding sequence to preempt"),
+            PreemptError::Alloc(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for PreemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PreemptError::NothingRunning => None,
+            PreemptError::Alloc(err) => Some(err),
+        }
+    }
+}
 
 /// One decode step over the running batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +117,9 @@ impl Scheduler {
     /// waiting prompt does not fit. Earlier sequences admitted by this call
     /// stay running. A prompt that does not fit is left at the head of the
     /// queue.
+    ///
+    /// A paused sequence already holds its blocks. Admission resumes it
+    /// without asking the pool for more.
     pub fn admit(&mut self) -> Result<Vec<SequenceId>, AllocError> {
         let mut admitted = Vec::new();
         let block_size = self.pool.block_size();
@@ -81,12 +127,16 @@ impl Scheduler {
             let Some(head) = self.waiting.front() else {
                 break;
             };
-            let need = BlockPool::blocks_needed(head.prompt_len(), block_size);
-            if self.pool.free_count() < need {
-                break;
+            if head.phase() != Phase::Paused {
+                let need = BlockPool::blocks_needed(head.prompt_len(), block_size);
+                if self.pool.free_count() < need {
+                    break;
+                }
             }
             let mut seq = self.waiting.pop_front().expect("front was observed");
-            if let Err(err) = seq.allocate_prompt(&mut self.pool) {
+            if seq.phase() == Phase::Paused {
+                seq.resume();
+            } else if let Err(err) = seq.allocate_prompt(&mut self.pool) {
                 self.waiting.push_front(seq);
                 return Err(err);
             }
@@ -94,6 +144,32 @@ impl Scheduler {
             self.running.push(seq);
         }
         Ok(admitted)
+    }
+
+    /// Take the newest decoding sequence out of the batch.
+    ///
+    /// The victim is placed at the back of the waiting queue, so a request
+    /// that was stuck at the head can be admitted next. The oldest running
+    /// sequence is left where it is. Finished sequences are not victims.
+    /// An empty decode batch returns [`PreemptError::NothingRunning`].
+    pub fn preempt(&mut self, policy: PreemptPolicy) -> Result<SequenceId, PreemptError> {
+        let index = self
+            .running
+            .iter()
+            .rposition(|seq| seq.phase() == Phase::Decoding)
+            .ok_or(PreemptError::NothingRunning)?;
+        let mut seq = self.running.remove(index);
+        let id = seq.id();
+        if policy == PreemptPolicy::Recompute {
+            if let Err(err) = seq.discard_progress(&mut self.pool) {
+                self.waiting.push_back(seq);
+                return Err(PreemptError::Alloc(err));
+            }
+        } else {
+            seq.pause();
+        }
+        self.waiting.push_back(seq);
+        Ok(id)
     }
 
     /// Append one generated token to every decoding sequence.
@@ -162,12 +238,12 @@ impl Scheduler {
         self.waiting.len()
     }
 
-    /// Oldest sequence that has not been admitted.
+    /// Sequence at the head of the waiting queue.
     pub fn next_waiting(&self) -> Option<&Sequence> {
         self.waiting.front()
     }
 
-    /// Sequences that currently hold blocks, in admission order.
+    /// Sequences in the batch, in admission order.
     pub fn running(&self) -> &[Sequence] {
         &self.running
     }
@@ -287,6 +363,121 @@ mod tests {
         assert_eq!(step.finished, vec![second]);
         sched.retire().unwrap();
         assert!(sched.is_idle());
+        assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+    }
+
+    #[test]
+    fn pause_frees_a_batch_slot_and_keeps_generated_tokens() {
+        let mut sched = scheduler(8, 4, 1);
+        let first = sched.add(4, 3);
+        let second = sched.add(4, 1);
+        sched.admit().unwrap();
+        sched.step().unwrap();
+        let blocks = sched.running()[0].blocks().to_vec();
+        assert_eq!(sched.running()[0].generated(), 1);
+        assert!(sched.admit().unwrap().is_empty());
+
+        let free_before = sched.pool().free_count();
+        assert_eq!(sched.preempt(PreemptPolicy::Pause).unwrap(), first);
+        assert!(sched.running().is_empty());
+        assert_eq!(sched.pool().free_count(), free_before);
+        assert_eq!(sched.next_waiting().unwrap().id(), second);
+
+        assert_eq!(sched.admit().unwrap(), vec![second]);
+        let parked = sched.next_waiting().unwrap();
+        assert_eq!(parked.id(), first);
+        assert_eq!(parked.phase(), Phase::Paused);
+        assert_eq!(parked.generated(), 1);
+        assert_eq!(parked.blocks(), blocks.as_slice());
+
+        assert_eq!(sched.step().unwrap().finished, vec![second]);
+        sched.retire().unwrap();
+        assert_eq!(sched.admit().unwrap(), vec![first]);
+        assert_eq!(sched.running()[0].phase(), Phase::Decoding);
+        assert_eq!(sched.running()[0].generated(), 1);
+        assert_eq!(sched.running()[0].blocks(), blocks.as_slice());
+
+        assert!(sched.step().unwrap().finished.is_empty());
+        assert_eq!(sched.step().unwrap().finished, vec![first]);
+        sched.retire().unwrap();
+        assert!(sched.is_idle());
+        assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+    }
+
+    #[test]
+    fn recompute_frees_blocks_so_a_waiting_prompt_can_fit() {
+        let mut sched = scheduler(1, 8, 2);
+        let first = sched.add(4, 2);
+        let second = sched.add(8, 0);
+        assert_eq!(sched.admit().unwrap(), vec![first]);
+        sched.step().unwrap();
+        assert_eq!(sched.running()[0].generated(), 1);
+        assert!(sched.admit().unwrap().is_empty());
+        assert_eq!(sched.pool().free_count(), 0);
+
+        assert_eq!(sched.preempt(PreemptPolicy::Recompute).unwrap(), first);
+        assert!(sched.running().is_empty());
+        assert_eq!(sched.pool().free_count(), 1);
+        assert_eq!(sched.next_waiting().unwrap().id(), second);
+
+        assert_eq!(sched.admit().unwrap(), vec![second]);
+        assert_eq!(sched.running()[0].phase(), Phase::Finished);
+        assert_eq!(sched.running()[0].len(), 8);
+        let parked = sched.next_waiting().unwrap();
+        assert_eq!(parked.id(), first);
+        assert_eq!(parked.phase(), Phase::Waiting);
+        assert_eq!(parked.generated(), 0);
+        assert_eq!(parked.len(), 0);
+
+        sched.retire().unwrap();
+        assert_eq!(sched.admit().unwrap(), vec![first]);
+        assert_eq!(sched.running()[0].generated(), 0);
+        assert_eq!(sched.running()[0].len(), 4);
+        assert!(sched.step().unwrap().finished.is_empty());
+        assert_eq!(sched.step().unwrap().finished, vec![first]);
+        sched.retire().unwrap();
+        assert!(sched.is_idle());
+        assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+    }
+
+    #[test]
+    fn the_oldest_running_sequence_stays_when_a_newer_one_is_preempted() {
+        let mut sched = scheduler(8, 4, 2);
+        let first = sched.add(4, 2);
+        let second = sched.add(4, 2);
+        let third = sched.add(4, 1);
+        sched.admit().unwrap();
+        sched.step().unwrap();
+
+        assert_eq!(sched.preempt(PreemptPolicy::Pause).unwrap(), second);
+        assert_eq!(sched.running().len(), 1);
+        assert_eq!(sched.running()[0].id(), first);
+        assert_eq!(sched.running()[0].generated(), 1);
+
+        assert_eq!(sched.admit().unwrap(), vec![third]);
+        assert_eq!(sched.next_waiting().unwrap().id(), second);
+        assert_eq!(sched.next_waiting().unwrap().phase(), Phase::Paused);
+        assert_eq!(sched.next_waiting().unwrap().generated(), 1);
+    }
+
+    #[test]
+    fn preempt_with_nothing_decoding_fails() {
+        let mut sched = scheduler(4, 4, 2);
+        assert_eq!(
+            sched.preempt(PreemptPolicy::Pause).unwrap_err(),
+            PreemptError::NothingRunning
+        );
+
+        let finished = sched.add(4, 0);
+        sched.admit().unwrap();
+        assert_eq!(sched.running()[0].phase(), Phase::Finished);
+        assert_eq!(
+            sched.preempt(PreemptPolicy::Recompute).unwrap_err(),
+            PreemptError::NothingRunning
+        );
+        assert_eq!(sched.running()[0].id(), finished);
+        assert_eq!(sched.waiting_len(), 0);
+        assert_eq!(sched.retire().unwrap(), vec![finished]);
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
     }
 }
