@@ -43,6 +43,13 @@ impl BlockId {
     pub fn index(self) -> u32 {
         self.0
     }
+
+    /// Build an id from a pool index.
+    ///
+    /// This does not allocate. The pool checks the index when it is used.
+    pub fn from_index(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 impl std::fmt::Display for BlockId {

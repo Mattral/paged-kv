@@ -1,8 +1,9 @@
 //! Python wrappers around the Rust pool, tables, prefix cache, and scheduler.
 //!
 //! The core crate stays free of PyO3. This module is the optional binding.
-//! KV bytes are still the caller's. `release` and `clear` return block
-//! references to the pool; dropping a Python object does not.
+//! `BlockPool.with_storage` keeps an f32 vector per token. `release` and
+//! `clear` return block references to the pool; dropping a Python object
+//! does not.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -35,6 +36,41 @@ impl BlockPool {
     fn free_count(&self) -> u32 {
         self.inner.free_count()
     }
+
+    /// Pool that stores `floats_per_token` f32 values in every token slot.
+    #[staticmethod]
+    fn with_storage(num_blocks: u32, block_size: u32, floats_per_token: u32) -> Self {
+        Self {
+            inner: ::paged_kv::BlockPool::with_storage(num_blocks, block_size, floats_per_token),
+        }
+    }
+
+    fn floats_per_token(&self) -> Option<u32> {
+        self.inner.floats_per_token()
+    }
+
+    fn kv(&self, block: u32, slot: u32) -> PyResult<Vec<f32>> {
+        self.inner
+            .kv(::paged_kv::BlockId::from_index(block), slot)
+            .map(|values| values.to_vec())
+            .map_err(alloc_err)
+    }
+
+    fn set_kv(&mut self, block: u32, slot: u32, values: Vec<f32>) -> PyResult<()> {
+        let dst = self
+            .inner
+            .kv_mut(::paged_kv::BlockId::from_index(block), slot)
+            .map_err(alloc_err)?;
+        if dst.len() != values.len() {
+            return Err(PyValueError::new_err(format!(
+                "expected {} floats, got {}",
+                dst.len(),
+                values.len()
+            )));
+        }
+        dst.copy_from_slice(&values);
+        Ok(())
+    }
 }
 
 #[pyclass]
@@ -65,6 +101,15 @@ impl BlockTable {
             .fork_prefix(&mut pool.inner, prefix_len)
             .map(|inner| Self { inner })
             .map_err(alloc_err)
+    }
+
+    /// `(block_index, slot)` for logical token `index`.
+    fn token_loc(&self, pool: &BlockPool, index: u32) -> PyResult<(u32, u32)> {
+        let loc = self
+            .inner
+            .token_loc(&pool.inner, index)
+            .map_err(alloc_err)?;
+        Ok((loc.block.index(), loc.slot))
     }
 
     /// Drop this table's block references. A second call releases nothing.
@@ -268,7 +313,30 @@ fn preempt_err(err: PreemptError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-/// Paged KV-cache block ids, a prefix cache, and an FCFS batcher.
+/// Allocate blocks for `token_ids` and write each token's K and V.
+#[pyfunction]
+fn fill_tokens(
+    pool: &mut BlockPool,
+    table: &mut BlockTable,
+    head_dim: u32,
+    token_ids: Vec<u32>,
+) -> PyResult<()> {
+    ::paged_kv::fill_tokens(&mut pool.inner, &mut table.inner, head_dim, &token_ids)
+        .map_err(alloc_err)
+}
+
+/// Dot `query_token`'s K with every stored K, in token order.
+#[pyfunction]
+fn attend(
+    pool: &BlockPool,
+    table: &BlockTable,
+    head_dim: u32,
+    query_token: u32,
+) -> PyResult<Vec<f32>> {
+    ::paged_kv::attend(&pool.inner, &table.inner, head_dim, query_token).map_err(alloc_err)
+}
+
+/// Paged KV blocks, stored f32 vectors, and an FCFS batcher.
 #[pymodule]
 fn paged_kv(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<BlockPool>()?;
@@ -276,6 +344,8 @@ fn paged_kv(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ContiguousTable>()?;
     module.add_class::<PrefixCache>()?;
     module.add_class::<Scheduler>()?;
+    module.add_function(wrap_pyfunction!(fill_tokens, module)?)?;
+    module.add_function(wrap_pyfunction!(attend, module)?)?;
     Ok(())
 }
 
@@ -344,6 +414,18 @@ assert sched.running() == []
 assert sched.waiting_len() == 1
 assert sched.free_count() == 8
 assert sched.is_idle() is False
+
+stored = paged_kv.BlockPool.with_storage(4, 2, 4)
+seq = paged_kv.BlockTable()
+paged_kv.fill_tokens(stored, seq, 2, [1, 2, 3])
+assert seq.len == 3
+assert paged_kv.attend(stored, seq, 2, 3) == [40.0, 60.0, 80.0]
+block, slot = seq.token_loc(stored, 2)
+assert stored.kv(block, slot) == [4.0, 8.0, 2.0, 4.0]
+stored.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])
+assert stored.kv(block, slot) == [9.0, 9.0, 9.0, 9.0]
+seq.release(stored)
+assert stored.free_count() == stored.capacity()
 ",
                 None,
                 None,
