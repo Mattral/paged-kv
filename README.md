@@ -1,22 +1,182 @@
 # paged-kv
 
-A Rust block pool for a paged KV cache, and a first-come, first-served continuous batcher.
+This crate tracks blocks for a paged KV cache, and it batches sequences first-come, first-served.
 
-The pool does not store tensors. The caller owns the KV bytes and addresses them with a `BlockId`. The scheduler does not run a model. It queues sequences, reserves prompt blocks, appends one fake decode token at a time, and retires finished sequences.
+You keep the tensors. A `BlockId` is an index into your own storage. The pool records which blocks are free, which sequence holds them, and how full each block is.
 
-## Paged metadata is slower than a contiguous span
+Paging is for many sequences sharing one fixed pool, and for two sequences that start with the same prompt. One sequence whose length you already know is a simpler problem. [`ContiguousTable`](#one-contiguous-length) is that simpler problem, and the timings below show it is faster.
 
-No KV bytes are copied. The charts compare bookkeeping only, on Linux WSL2, an i9-9900, rustc 1.99.1. Each timed figure is the median of 21 release runs after 3 warmup runs.
+## Try it
 
-![Paged growth is a long bar. Contiguous doubling is a short one. Their ranges do not overlap.](docs/paged-vs-contiguous.svg)
+```sh
+cargo test
+cargo test -p paged-kv-py
+cargo bench --bench paged_vs_contiguous
+cargo bench --bench alloc_load
+cargo bench --bench scheduler_overhead
+```
 
-512 sequences grow to 260 tokens, one token at a time, and stay live together. The paged median is 5.42 ms. The contiguous doubling median is 0.25 ms. That is about 22×. The slowest doubling run (0.41 ms) is still well under the fastest paged run (5.19 ms).
+Each bench prints nanoseconds. The charts are one release run on an Intel i9-9900, rustc 1.99.1: 3 warmup runs, then the median of 21.
+
+## Reserve tokens for one sequence
+
+```rust
+use paged_kv::{BlockPool, BlockTable};
+
+fn main() -> Result<(), paged_kv::AllocError> {
+    let mut pool = BlockPool::new(128, 16);
+    let mut table = BlockTable::new();
+
+    table.grow(&mut pool, 32)?; // prompt
+    table.grow(&mut pool, 33)?; // one decoded token
+
+    table.release(&mut pool)?;
+    Ok(())
+}
+```
+
+`BlockPool::new(128, 16)` is 128 blocks of 16 token slots. `grow` extends the logical length. Crossing a block boundary takes a block from the free list. `release` gives the blocks back.
+
+The table does not own the pool. Dropping a table without `release` leaves those blocks marked in use until the pool is dropped. The type is marked `must_use`.
+
+## Batch a few sequences
+
+```rust
+use paged_kv::{BlockPool, Scheduler};
+
+fn main() -> Result<(), paged_kv::AllocError> {
+    let mut sched = Scheduler::new(BlockPool::new(32, 16), 1);
+    let first = sched.add(32, 1);
+    let second = sched.add(16, 1);
+
+    assert_eq!(sched.admit()?, vec![first]);
+    assert_eq!(sched.next_waiting().map(|seq| seq.id()), Some(second));
+
+    let step = sched.step()?;
+    assert_eq!(step.finished, vec![first]);
+    assert_eq!(sched.retire()?, vec![first]);
+
+    assert_eq!(sched.admit()?, vec![second]);
+    assert_eq!(sched.step()?.finished, vec![second]);
+    assert_eq!(sched.retire()?, vec![second]);
+    assert!(sched.is_idle());
+    Ok(())
+}
+```
+
+`add` only queues the request. `admit` reserves the whole prompt for the oldest waiting sequence, while the batch has room and the prompt fits. A prompt that does not fit stays at the head of the queue, and smaller requests behind it wait. `step` appends one token to every decoding sequence, or to none of them if the pool cannot cover the whole batch. A finished sequence keeps its batch slot until `retire`. A request with `max_new_tokens == 0` finishes as soon as its prompt is reserved.
+
+When the batch is full, or the next prompt needs memory the batch is holding, you can preempt the newest decoding sequence. The oldest one stays. Admission does not preempt on its own. The preempted sequence goes to the back of the queue, so the request that was stuck at the front can run.
+
+```rust
+use paged_kv::{BlockPool, PreemptPolicy, Scheduler};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut sched = Scheduler::new(BlockPool::new(32, 16), 2);
+    sched.add(16, 4);
+    sched.add(16, 4);
+    sched.admit()?;
+    // Newest decoding sequence. Pause keeps its blocks.
+    sched.preempt(PreemptPolicy::Pause)?;
+    // The older one is still decoding. Recompute frees its blocks.
+    sched.preempt(PreemptPolicy::Recompute)?;
+    Ok(())
+}
+```
+
+`Pause` keeps that sequence's blocks and the tokens it already generated. The next time it is admitted, decode continues. This frees a batch slot and does not free pool memory. `Recompute` returns the blocks to the pool and forgets the generated tokens. The sequence is prefilled again later. This is the policy that makes room for another prompt.
+
+## Share a prompt prefix
+
+The cache never reads token ids. You hash the prompt, or a prefix of it, and use that `u64` as the key.
+
+```rust
+use paged_kv::{BlockPool, BlockTable, PrefixCache};
+
+fn main() -> Result<(), paged_kv::AllocError> {
+    let mut pool = BlockPool::new(32, 16);
+    let mut table = BlockTable::new();
+    table.grow(&mut pool, 32)?;
+
+    let prompt_hash = 0xabc;
+    let mut cache = PrefixCache::new();
+    cache.insert(&mut pool, prompt_hash, &table)?;
+
+    let child = cache
+        .lookup(&mut pool, prompt_hash, 32)?
+        .expect("the prefix was cached");
+    assert_eq!(cache.hit_rate(), 1.0);
+    child.release(&mut pool)?;
+
+    cache.clear(&mut pool)?;
+    table.release(&mut pool)?;
+    Ok(())
+}
+```
+
+A lookup that forks a cached prefix is a hit. A missing key, or a cached table shorter than the prefix you asked for, is a miss. `hit_rate` is hits divided by hits plus misses, and it is `0.0` before the first lookup. `clear` returns the cached blocks. The scheduler does not consult this cache. Sharing is a step you take yourself.
+
+## One contiguous length
+
+```rust
+use paged_kv::ContiguousTable;
+
+fn main() -> Result<(), paged_kv::AllocError> {
+    let mut span = ContiguousTable::new();
+    span.reserve_exact(260);
+    span.grow(260)?;
+    assert_eq!(span.capacity(), 260);
+    Ok(())
+}
+```
+
+There is no pool, no free list, and no sharing. `reserve_exact` sets the capacity to that length. `grow` without a reserve doubles capacity until the length fits, the way a normal buffer grows. `grow` does not shrink the span.
+
+## From Python
+
+The bindings live in `paged-kv-py` and wrap the same types. Build the extension and rename it so Python can import it:
+
+```sh
+cargo build -p paged-kv-py
+mkdir -p /tmp/paged-kv-py
+cp target/debug/libpaged_kv.so /tmp/paged-kv-py/paged_kv.so
+PYTHONPATH=/tmp/paged-kv-py python3
+```
+
+```python
+import paged_kv
+
+pool = paged_kv.BlockPool(128, 16)
+table = paged_kv.BlockTable()
+table.grow(pool, 32)
+table.grow(pool, 33)
+table.release(pool)
+
+sched = paged_kv.Scheduler(32, 16, 4)
+first = sched.add(32, 8)
+sched.admit()
+decoded, finished = sched.step()
+sched.preempt("recompute")  # "pause" keeps the blocks instead
+sched.retire()
+```
+
+`table.len` is the logical length. `preempt` takes the string `"pause"` or `"recompute"`. Failures raise `ValueError`. This is a thin wrapper around the Rust API, covered by `a_python_caller_reserves_shares_and_preempts`. It is not a serving client.
+
+## What the timings say
+
+No KV bytes are copied. The numbers are the cost of updating lengths, free lists, and block ids.
+
+![One token at a time, paged blocks take much longer than a doubling length. The ranges do not overlap.](docs/paged-vs-contiguous.svg)
+
+512 sequences grow to 260 tokens, one token at a time, and stay live together. Paged blocks take 5.42 ms. A contiguous length that doubles takes 0.25 ms. That is about 22×. The slowest doubling run, 0.41 ms, is still under the fastest paged run, 5.19 ms. Dividing the paged median by 512 × 260 steps is about 40 ns of bookkeeping per step.
+
+Each paged step may pop the free list, update a used-slot count, and copy the block-id list so a failed `grow` can roll back. A new block is handed out every 16 tokens. The contiguous side adds one to a length.
 
 ![Exact reserve holds 260 slots, paging holds 272, and doubling holds 512.](docs/reserved-slots.svg)
 
-The time win for doubling is not a memory win. A doubling buffer for 260 tokens lands on 512 slots. Paged blocks of 16 land on 272, twelve of them unused. An exact reserve stays at 260. So paging is tighter than geometric growth and looser than knowing the length up front.
+Doubling is the fast bar, and it is also the roomiest. For one sequence of 260 tokens, an exact reserve holds 260 slots, pages of 16 hold 272 (a 12-slot tail), and doubling lands on 512. Paging reserves less spare room than geometric growth. Knowing the length in advance reserves less than paging.
 
-Reserving the whole 260 in one call, instead of stepping, drops the paged median to 0.83 ms (min 0.81, max 1.08). The contiguous exact path is a capacity write: median 2.8 µs. One sample spiked to 20 µs, and that spike is still below every paged sample. About 290× at the medians. This is not the decode loop. It is the cost of walking the block pool once per sequence.
+Asking for all 260 tokens in one call, instead of stepping, brings the paged median to 0.83 ms (min 0.81, max 1.08). The contiguous exact path writes one capacity: median 2.8 µs. One sample spiked to 20 µs, and that spike is still below every paged sample. About 290× at the medians. This is one reservation, not the decode loop.
 
 | Policy | min | median | max |
 | --- | --- | --- | --- |
@@ -27,105 +187,62 @@ Reserving the whole 260 in one call, instead of stepping, drops the paged median
 
 `cargo bench --bench paged_vs_contiguous` prints the nanoseconds behind this table.
 
-## Recycling blocks stays in the same band
+![The first fill and a recycled free list overlap around 6 ns per block.](docs/alloc-load.svg)
 
-![The first fill and a recycled free list have overlapping whiskers around 6 ns per block.](docs/alloc-load.svg)
+`cargo bench --bench alloc_load` allocates 100,000 blocks, marks each one full, and frees them. Pool construction is outside the timer. The first pass is 6.6 ns per block at the median (6.1 to 10.8). The second pass, on a warm free list, is 5.6 ns (5.4 to 9.1). The ranges overlap, so recycling is in the same band as the first fill.
 
-`cargo bench --bench alloc_load` fills 100,000 blocks, marks each one full, and frees them. Pool construction is outside the timer. The first pass is 6.6 ns per block at the median (6.1 to 10.8). The second pass, on a warm free list, is 5.6 ns (5.4 to 9.1). The ranges overlap, so recycling is not a clear saving and not a penalty either.
+![The scheduler's whole range sits to the right of the slowest one-sequence run.](docs/scheduler-overhead.svg)
 
-## Scheduler queue versus one sequence
-
-`cargo bench --bench scheduler_overhead` times the scheduler against a loop that runs the same prompts and decode tokens one sequence at a time. Both paths use the paged pool. This is not model throughput.
-
-![The scheduler bar is longer, and its whole range sits to the right of the slowest one-sequence run](docs/scheduler-overhead.svg)
-
-256 sequences, 128 prompt tokens, 64 generated tokens, block size 16, batch of 16, pool of 192 blocks. Release build on Linux WSL2 x86_64, rustc 1.99.1. Three warmup iterations, then 21 timed runs.
-
-The scheduler median is 1.44× the one-sequence loop. The queue keeps 16 sequences live. The other loop finishes one sequence before the next. On this metadata-only workload, that bookkeeping costs more than it saves. Two earlier runs on this host were 1.38× and 1.38×.
-
-The chart is drawn from this run:
+`cargo bench --bench scheduler_overhead` runs 256 sequences of 128 prompt tokens and 64 generated tokens, block size 16, batch of 16, pool of 192 blocks. Both paths use the paged pool. The one-sequence loop finishes a sequence before starting the next. The scheduler keeps 16 live.
 
 | Path | min | median | max |
 | --- | --- | --- | --- |
 | One sequence at a time | 0.824 ms | 0.836 ms | 1.021 ms |
 | Scheduler, batch of 16 | 1.148 ms | 1.207 ms | 1.554 ms |
 
-## What works
+The scheduler median is 1.44× the one-sequence loop, and every scheduler run is slower than the slowest one-sequence run. Two earlier runs on this machine were 1.38× and 1.38×. On bookkeeping alone, the queue costs more than it saves. There is no model step underneath for that cost to hide behind.
 
-- `BlockPool` allocates fixed-size blocks, recycles them from a free list, counts owners, and copy-on-writes a shared block.
-- `BlockTable` maps a token length onto blocks and can fork a prefix.
-- `Sequence` splits that length into prompt tokens and generated tokens (`prompt_and_generated_tokens_share_one_table`).
-- `ContiguousTable` is the non-paged baseline: one length and one capacity (`grow_doubles_capacity_until_the_length_fits`, `reserve_exact_does_not_double_past_the_request`).
-- `Scheduler` admits in arrival order, steps the batch, and retires finished sequences (`step_then_retire_frees_blocks_and_admits_the_next_sequence`, `fake_generation_joins_sequences_and_frees_every_block`).
+## What these numbers leave out
 
-`cargo test` covers the behavior named below.
+- The benches copy no KV bytes. A real decode step does, and that cost is not measured here.
+- Every sequence in the paged-versus-contiguous bench stays live at once. A pool that is filled, freed, and filled again over a long run is a different story. The allocate/free bench is the one that recycles, and it shows no clear saving.
+- Nothing in the benches shares a prefix. `PrefixCache` can avoid a second set of blocks. That saving is not in the timings.
+- The scheduler adds its own cost on top of paging. Head-of-line blocking and all-or-nothing steps are part of that design.
 
 ## What this is not
 
-- No model, tokenizer, attention kernel, or KV tensor copy.
-- No Python bindings.
-- No preemption, and no priority other than arrival order.
-- The scheduler does not share prefixes. `BlockTable::fork_prefix` can, and admission does not call it.
-- No chunked prefill. Admission reserves the whole prompt at once.
-- A prompt that does not fit is not skipped. Smaller requests behind it wait (`a_prompt_that_does_not_fit_blocks_smaller_requests_behind_it`).
-- A finished sequence keeps its batch slot until `retire` (`a_finished_sequence_keeps_its_slot_until_retire`).
-- `step` grows every decoding sequence or none of them (`step_is_all_or_nothing_when_the_batch_cannot_grow`).
-- The paged-versus-contiguous bench does not move KV bytes, does not share prefixes, and does not run sequences one after another. A fixed pool that is reused over time is not what those timings show.
-- No multi-device cache.
+- A model, a tokenizer, an attention kernel, or a KV tensor.
+- A serving server, and not a client for one.
+- A multi-device cache.
+- Automatic prefix sharing. The cache is there. `Scheduler::admit` does not call it.
+- Automatic preemption. `preempt` runs when you call it.
+- Chunked prefill. Admission reserves the whole prompt.
+- A skip of a prompt that does not fit. The requests behind it wait.
 
-## Where paging costs more
-
-- Stepping one token at a time touches the free list, the used-slot array, and release. A contiguous length does not. That is the 22× gap above.
-- Even one `grow` to the full length still allocates every block. An exact reserve writes one integer.
-- The tail of a partial block is empty slots. At block size 16 and length 260, that is 12 slots per sequence. Doubling can waste more than that. Exact reserve wastes none.
-- Owners, copy-on-write, and `release` are extra rules. Dropping a table without `release` leaks references. A `ContiguousTable` does not borrow from a pool.
-- The scheduler adds another cost on top of paging. Its median was 1.44× a one-sequence loop that already used the paged pool. Head-of-line blocking and all-or-nothing steps are part of that design, not of the contiguous baseline.
-- Prefix sharing can avoid a second copy. Nothing in these benches shares a prefix, so that benefit is not a measured saving.
-
-Dropping a `BlockTable` or a `Sequence` that holds blocks, without `release`, leaks those references until the pool is dropped. The table type is marked `must_use`. The tests release what they allocate.
-
-## Scheduler
-
-Admission is first-come, first-served. Arrival order is the admission order, which keeps the queue testable. There is no priority heap.
-
-`add` enqueues a prompt length and a decode budget. It does not allocate. `admit` reserves blocks for the oldest waiting prompt while the batch has a free slot and the prompt fits (`admission_follows_arrival_order_and_stops_at_the_batch_size`). `step` appends one generated token to each decoding sequence. `retire` returns finished blocks to the pool. A request with `max_new_tokens == 0` finishes as soon as its prompt is reserved (`zero_new_tokens_finishes_when_the_prompt_is_reserved`).
-
-## Memory layout
+## How the pool is laid out
 
 `BlockPool::new(num_blocks, block_size)` builds three parallel structures, indexed by `BlockId`:
 
 | State | Meaning |
 | --- | --- |
 | `refcounts[id]` | Live owners. `0` means the block is free. |
-| `used[id]` | Initialized token slots in that block. `0` when the block is free, and at most `block_size` when it is live. |
-| `free_list` | Stack of free ids. `allocate` pops it. `free` pushes an id only when its refcount hits zero. |
+| `used[id]` | Initialized token slots in that block, at most `block_size`. |
+| `free_list` | Stack of free ids. `allocate` pops it. `free` pushes an id when its refcount hits zero. |
 
-A fresh pool is stacked from high ids down to zero, so the first allocations are `0, 1, 2, ...` (`most_recently_freed_block_is_reused_first`). After that, the most recently freed id is handed out next.
+A fresh pool is stacked from high ids down to zero, so the first allocations are `0, 1, 2, ...`. After that, the most recently freed id is handed out next.
 
-One block represents `block_size` token slots. Those bytes are not in this crate. A block id is valid only in the pool that issued it. Copying a `BlockId` does not change its refcount (`shared_block_stays_live_until_the_last_owner_frees_it`).
+Blocks are interchangeable. A hole on the free list can be used by any request, so the pool has no external fragmentation. The waste it reports is internal: `block_size - used` on each live block, counted once even when several owners share it. An idle pool reports zero. A freshly allocated block starts at `used == 0`, so it counts as fully wasted until the caller fills it.
 
-Blocks are interchangeable. A hole on the free list is reusable for any request, so the pool has no external fragmentation. The waste it reports is internal: `block_size - used` on each live block. `wasted_slots` sums that once per physical block, including when several owners share it (`shared_owners_do_not_double_count_tail_waste`). An idle pool reports zero (`idle_pool_has_zero_fragmentation`). A freshly allocated block starts at `used == 0`, so it counts as fully wasted until the caller fills it (`partial_block_reports_tail_waste`).
+`allocate` returns one block with refcount 1. `acquire` adds an owner. `free` drops one owner and recycles the block at zero. A second free of an already free block is rejected. `cow` returns the same id when the refcount is 1. When the block is shared, it allocates a new block, copies the initialized length, and drops one reference to the original. The caller copies KV bytes only when the returned id differs. If that allocation fails, the shared block is unchanged.
 
-## Ownership
-
-- `allocate` returns one block with refcount 1.
-- `acquire` adds an owner of the current contents. It fails on a free or unknown id (`acquire_rejects_a_free_or_unknown_block`).
-- `free` drops one owner. The initialized length stays until the last owner frees the block. The last free pushes the id and clears `used` (`freeing_a_partial_block_drops_its_waste`). A second free of an already free block is `NotAllocated` and does not push a duplicate (`double_free_is_rejected_and_does_not_grow_the_free_list`).
-- `cow` returns the same id when the refcount is 1 (`cow_keeps_a_unique_block_in_place`). When the block is shared, it allocates a new block, copies the initialized length, and drops one reference to the original. The other owners still see the original length (`cow_forks_a_shared_block_without_changing_the_other_owner`). The caller copies KV bytes only when the returned id differs. If the pool cannot allocate the fork, the shared block is unchanged (`cow_of_a_shared_block_fails_cleanly_when_the_pool_is_full`).
-- `BlockTable` holds one reference per block it lists. It does not own the pool. `release` drops those references. Other tables that still hold a block keep it allocated (`fork_on_a_block_boundary_shares_only_the_covered_blocks`).
-
-## How a prefix fork shares blocks
-
-`BlockTable::grow` appends tokens. Full blocks are marked fully used. The tail holds the remainder (`grow_fills_full_blocks_and_a_partial_tail`). `grow` does not shorten a table (`grow_rejects_a_shorter_length_and_an_allocation_it_cannot_finish`). If the pool cannot cover the whole request, the table and the pool stay as they were.
+`BlockTable` holds one reference per block it lists. Full blocks are marked fully used. The tail holds the remainder. `grow` does not shorten a table. If the pool cannot cover the whole request, the table and the pool stay as they were.
 
 `fork_prefix(prefix_len)` builds another table for the first `prefix_len` tokens:
 
-- A prefix that ends on a block boundary shares those full blocks and leaves the parent's later blocks private.
-- A prefix that covers the whole table also shares a partial tail. The next append into that tail copy-on-writes it (`fork_of_the_whole_sequence_shares_the_tail_until_append`). If that copy cannot be allocated, neither table changes (`extending_a_shared_tail_fails_cleanly_when_cow_cannot_allocate`).
-- A prefix that stops inside a block the parent has already written past shares only the full blocks before that point. The child gets a new private block with `used` set to the partial length, so it does not alias the parent's later tokens (`fork_inside_a_written_block_gets_a_private_boundary`). If that private block cannot be allocated, the acquires are rolled back (`fork_rolls_back_acquires_when_the_private_block_cannot_be_allocated`).
-- A zero-length prefix allocates nothing. A prefix past the table length returns `PrefixOutOfRange` and changes no refcount (`empty_and_overlong_prefixes_do_not_change_refcounts`).
-
-Full blocks are not written in place. Extending past a full block allocates a new block, including after a boundary fork.
+- A prefix that ends on a block boundary shares those full blocks.
+- A prefix that covers the whole table also shares a partial tail. The next append into that tail copy-on-writes it.
+- A prefix that stops inside a block the parent has already written past shares the full blocks before that point and gets a new private block for the partial length.
+- A failure rolls the acquires back. A zero-length prefix allocates nothing. A prefix past the table length changes no refcount.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable};
@@ -135,9 +252,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
     let mut parent = BlockTable::new();
     parent.grow(&mut pool, 20)?;
 
-    // Same contents, including the partial tail: both tables hold those ids.
     let mut child = parent.fork_prefix(&mut pool, 20)?;
-    // The next token copy-on-writes the shared tail. The parent keeps the old id.
     child.grow(&mut pool, 21)?;
 
     child.release(&mut pool)?;
@@ -146,28 +261,28 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 }
 ```
 
-## What a Python caller would do
+## Where a claim is checked
 
-PyO3 bindings are not implemented. Nothing here imports. The call order a binding would expose is the same as the Rust API:
-
-```python
-pool = BlockPool(num_blocks=128, block_size=16)
-table = BlockTable()
-table.grow(pool, prompt_len)
-while table.len < prompt_len + max_new_tokens:
-    table.grow(pool, table.len + 1)
-table.release(pool)
-```
-
-`ContiguousTable` would skip the pool and call `reserve_exact` or `grow` on the table alone.
-
-## Tests and benchmarks
-
-```sh
-cargo test
-cargo bench --bench paged_vs_contiguous
-cargo bench --bench alloc_load
-cargo bench --bench scheduler_overhead
-```
-
-Each bench prints nanoseconds. The charts and tables above are one release run on this WSL host.
+| Claim | Test or bench |
+| --- | --- |
+| Allocate, free, and reuse the last freed id | `allocate_and_free_round_trip`, `most_recently_freed_block_is_reused_first` |
+| Tail waste, counted once when a block is shared | `partial_block_reports_tail_waste`, `shared_owners_do_not_double_count_tail_waste` |
+| Copy-on-write of a shared block | `cow_keeps_a_unique_block_in_place`, `cow_forks_a_shared_block_without_changing_the_other_owner` |
+| Prefix fork, including rollback | `fork_on_a_block_boundary_shares_only_the_covered_blocks`, `fork_of_the_whole_sequence_shares_the_tail_until_append`, `fork_inside_a_written_block_gets_a_private_boundary`, `fork_rolls_back_acquires_when_the_private_block_cannot_be_allocated` |
+| `grow` refuses to shrink, and a failed grow changes nothing | `grow_rejects_a_shorter_length_and_an_allocation_it_cannot_finish` |
+| Prompt and generated tokens share one table | `prompt_and_generated_tokens_share_one_table` |
+| `max_new_tokens == 0` finishes at reservation | `zero_new_tokens_finishes_when_the_prompt_is_reserved` |
+| Doubling and exact reserve | `grow_doubles_capacity_until_the_length_fits`, `reserve_exact_does_not_double_past_the_request` |
+| Arrival order, and a full batch | `admission_follows_arrival_order_and_stops_at_the_batch_size` |
+| A prompt that does not fit blocks the queue | `a_prompt_that_does_not_fit_blocks_smaller_requests_behind_it` |
+| A finished sequence keeps its slot | `a_finished_sequence_keeps_its_slot_until_retire` |
+| `step` is all or nothing | `step_is_all_or_nothing_when_the_batch_cannot_grow` |
+| A fake generation loop frees every block | `fake_generation_joins_sequences_and_frees_every_block` |
+| Pause keeps generated tokens | `pause_frees_a_batch_slot_and_keeps_generated_tokens` |
+| Recompute frees blocks for the waiting prompt | `recompute_frees_blocks_so_a_waiting_prompt_can_fit` |
+| The oldest running sequence stays | `the_oldest_running_sequence_stays_when_a_newer_one_is_preempted` |
+| Prefix hit, miss, and rate | `a_miss_then_a_hit_shares_blocks_and_records_the_rate`, `a_cached_table_that_is_too_short_counts_as_a_miss` |
+| Python wrappers | `a_python_caller_reserves_shares_and_preempts` |
+| Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
+| Allocate and free under load | `cargo bench --bench alloc_load` |
+| Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |
