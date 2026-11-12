@@ -3,12 +3,15 @@
 //! [`BlockPool`] tracks fixed-size blocks. [`BlockTable`] maps one sequence's
 //! tokens onto those blocks and can fork a shared prefix. [`Scheduler`]
 //! admits sequences first-come, first-served and retires them when their
-//! token budget is spent. Callers own the KV bytes and address them by
-//! [`BlockId`].
+//! token budget is spent. [`ContiguousTable`] is the non-paged baseline:
+//! one length and one capacity, with no blocks. Callers own the KV bytes
+//! and address paged storage by [`BlockId`].
 
+mod contiguous;
 mod scheduler;
 mod sequence;
 
+pub use contiguous::ContiguousTable;
 pub use scheduler::{DecodeStep, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
 
@@ -52,7 +55,7 @@ pub enum AllocError {
     },
     /// The refcount would exceed `u32::MAX`.
     RefcountOverflow(BlockId),
-    /// [`BlockTable::grow`] was asked to shorten the table.
+    /// `grow` was asked to shorten a table.
     LengthRegression {
         /// Current logical token count.
         current: u32,
