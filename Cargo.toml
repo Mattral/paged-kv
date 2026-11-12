@@ -12,3 +12,7 @@ harness = false
 [[bench]]
 name = "alloc_load"
 harness = false
+
+[[bench]]
+name = "paged_vs_contiguous"
+harness = false
