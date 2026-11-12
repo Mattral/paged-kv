@@ -6,7 +6,7 @@ This library keeps fixed-size blocks. A pool created with storage holds one `f32
 cargo run --example fake_attention
 ```
 
-That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. There is no loaded model. A scheduler whose pool stores vectors runs this same step on admission and on every token it appends. A metadata pool does not.
+That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. One fixed-weight block in this repo chooses the next id on a storage pool. It is not trained, and it does not load anyone else's weights. A metadata pool does not run it.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -74,7 +74,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Batch a few sequences
 
-The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. `cargo run --example scheduled_attention` encodes the string `"hi"`, runs that prompt, and prints the tokens as text. The next id is still one past the last id. A metadata pool does not, and that is what the charts measure. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts are that comparison, on an Intel i9-9900 with rustc 1.99.1.
+The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. `cargo run --example scheduled_attention` encodes the string `"hi"`, runs that block, and prints the tokens as text. The next id is the block's argmax, and the new slot stores the block's K and V. A metadata pool does not run the block, and that is what the charts measure. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts are that comparison, on an Intel i9-9900 with rustc 1.99.1.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
@@ -228,7 +228,7 @@ The scheduler median is 1.44× the one-sequence loop, and every scheduler run is
 
 ## What this is not
 
-- A trained model, or a loader for someone else's weights. `encode` and `decode` are a byte vocabulary, not a BPE model. The vector written for a token id is a fixed embedding. `attend` reads the stored K and V.
+- A trained model, or a loader for someone else's checkpoint. `encode` and `decode` are a byte vocabulary, not a BPE model. On a storage pool the scheduler writes K and V from one fixed block and takes the next id from that block. `fill_tokens` still writes a fixed embedding for a caller who does not use the scheduler. `attend` reads whatever is stored.
 - A GPU tensor, or fp16. Storage is one `f32` vector per token slot on the CPU.
 - A serving server, and not a client for one.
 - A multi-device cache.
@@ -303,7 +303,8 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Stored vectors, zeroed on free, copied by `cow` | `stored_kv_is_writable_until_the_block_is_freed`, `cow_copies_stored_kv_and_leaves_the_other_owner_unchanged` |
 | A token index maps to a block and slot | `token_loc_maps_a_logical_index_onto_a_block_slot` |
 | `attend` reads stored K and V, and release zeroes the block | `fill_then_attend_reads_the_stored_keys_and_free_zeroes_them` |
-| A scheduled generation writes non-zero KV and then releases it | `a_generation_loop_writes_nonzero_kv` |
+| A scheduled generation writes the block's K and V and appends the id that block chose | `a_generation_loop_writes_nonzero_kv` |
+| The fixed block's weights stay put, and its scores read the stored rows | `weights_do_not_drift`, `forward_reads_the_stored_rows` |
 | `encode` then `decode` returns the same string | `encode_then_decode_round_trips` |
 | Python install path, including `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |

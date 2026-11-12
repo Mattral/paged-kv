@@ -133,28 +133,6 @@ impl Sequence {
         Ok(())
     }
 
-    /// Reserve the prompt with [`crate::fill_tokens`] and write each id.
-    ///
-    /// `token_ids.len()` is the prompt length. On failure the table is
-    /// released and the sequence stays waiting.
-    pub(crate) fn fill_prompt(
-        &mut self,
-        pool: &mut BlockPool,
-        head_dim: u32,
-        token_ids: &[u32],
-    ) -> Result<(), AllocError> {
-        debug_assert_eq!(self.phase, Phase::Waiting);
-        debug_assert_eq!(self.generated, 0);
-        debug_assert_eq!(token_ids.len() as u32, self.prompt_len);
-        if let Err(err) = crate::fill_tokens(pool, &mut self.table, head_dim, token_ids) {
-            let table = std::mem::take(&mut self.table);
-            let _ = table.release(pool);
-            return Err(err);
-        }
-        self.enter_after_prompt();
-        Ok(())
-    }
-
     /// Where logical token `index` lives.
     ///
     /// `block_size` must be the block size of the pool this sequence grew on.
@@ -176,10 +154,6 @@ impl Sequence {
             block,
             slot: index % block_size,
         })
-    }
-
-    pub(crate) fn table(&self) -> &BlockTable {
-        &self.table
     }
 
     fn enter_after_prompt(&mut self) {
@@ -209,6 +183,12 @@ impl Sequence {
             self.phase = Phase::Finished;
         }
         Ok(finished)
+    }
+
+    pub(crate) fn finish(&mut self) {
+        if self.phase == Phase::Decoding {
+            self.phase = Phase::Finished;
+        }
     }
 
     /// Drop this sequence's block references.

@@ -1,7 +1,8 @@
-//! Encode a short string and decode the tokens the scheduler writes.
+//! Encode a short string and print the tokens the fixed-weight block predicts.
 //!
-//! The pool stores one vector per slot. Admission writes the prompt. Each
-//! step still appends one past the last token id. There is no model.
+//! Admission writes that block's K and V for the prompt. Each step appends
+//! the id the block chose and writes that id's K and V. The block is not
+//! trained.
 //!
 //! Run with `cargo run --example scheduled_attention --quiet`.
 
@@ -30,8 +31,13 @@ fn main() -> Result<(), paged_kv::AllocError> {
         assert!(steps < 8, "generation did not finish");
     }
 
-    let scores = sched.scores(id).expect("scores stay until retire").to_vec();
-    assert_eq!(scores.len(), prompt.len() + 2);
+    let ids = sched
+        .token_ids(id)
+        .expect("generation wrote tokens")
+        .to_vec();
+    assert_eq!(&ids[..prompt.len()], prompt.as_slice());
+    assert_ne!(&ids[prompt.len()..], &[106, 107]);
+    let scores = sched.scores(id).expect("scores stay until retire");
     let sum: f32 = scores.iter().copied().sum();
     assert!((sum - 1.0).abs() < 1e-5);
 
