@@ -8,3 +8,7 @@ readme = "README.md"
 [[bench]]
 name = "scheduler_overhead"
 harness = false
+
+[[bench]]
+name = "alloc_load"
+harness = false
