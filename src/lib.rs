@@ -10,15 +10,26 @@
 //! tracks ids only. [`BlockPool::with_storage`] also keeps one `f32` vector
 //! per token slot, addressed by [`BlockId`].
 
+mod attention;
 mod contiguous;
 mod prefix_cache;
 mod scheduler;
 mod sequence;
 
+pub use attention::{attend, fill_tokens, write_token};
 pub use contiguous::ContiguousTable;
 pub use prefix_cache::PrefixCache;
 pub use scheduler::{DecodeStep, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
+
+/// Block id and slot of one token inside a [`BlockTable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenLoc {
+    /// Block that holds the token.
+    pub block: BlockId,
+    /// Slot inside that block, in `0..block_size`.
+    pub slot: u32,
+}
 
 /// Identifier of one block in a [`BlockPool`].
 ///
@@ -89,6 +100,20 @@ pub enum AllocError {
     ///
     /// Copy the block with [`BlockPool::cow`] and write the new id.
     SharedWrite(BlockId),
+    /// A token index is past the table that would hold it.
+    TokenOutOfRange {
+        /// Requested token index.
+        index: u32,
+        /// Logical token count of the table.
+        len: u32,
+    },
+    /// The stored vector is not two halves of `head_dim`.
+    KvWidth {
+        /// Width stored by the pool.
+        floats_per_token: u32,
+        /// Head width the attention step was given.
+        head_dim: u32,
+    },
 }
 
 impl std::fmt::Display for AllocError {
@@ -128,6 +153,16 @@ impl std::fmt::Display for AllocError {
             AllocError::SharedWrite(id) => {
                 write!(f, "block {id} is shared; copy it before writing kv")
             }
+            AllocError::TokenOutOfRange { index, len } => {
+                write!(f, "token {index} is outside a table of length {len}")
+            }
+            AllocError::KvWidth {
+                floats_per_token,
+                head_dim,
+            } => write!(
+                f,
+                "kv width {floats_per_token} is not two halves of head dim {head_dim}"
+            ),
         }
     }
 }
@@ -512,6 +547,31 @@ impl BlockTable {
     /// Blocks in token order. Only the last block may be partially used.
     pub fn blocks(&self) -> &[BlockId] {
         &self.blocks
+    }
+
+    /// Where logical token `index` lives.
+    ///
+    /// `pool` must be the pool this table grew on. Its block size is the
+    /// stride. The returned slot is what [`BlockPool::kv_mut`] writes.
+    pub fn token_loc(&self, pool: &BlockPool, index: u32) -> Result<TokenLoc, AllocError> {
+        if index >= self.len {
+            return Err(AllocError::TokenOutOfRange {
+                index,
+                len: self.len,
+            });
+        }
+        let block_size = pool.block_size();
+        let block_index = (index / block_size) as usize;
+        let Some(block) = self.blocks.get(block_index).copied() else {
+            return Err(AllocError::TokenOutOfRange {
+                index,
+                len: self.len,
+            });
+        };
+        Ok(TokenLoc {
+            block,
+            slot: index % block_size,
+        })
     }
 
     /// Grow the table until it covers `new_len` tokens.
@@ -1065,6 +1125,41 @@ mod tests {
         table.release(&mut pool).unwrap();
         assert_eq!(pool.free_count(), pool.capacity());
         assert_eq!(pool.wasted_slots(), 0);
+    }
+
+    #[test]
+    fn token_loc_maps_a_logical_index_onto_a_block_slot() {
+        let mut pool = BlockPool::with_storage(4, 4, 2);
+        let mut table = BlockTable::new();
+        table.grow(&mut pool, 10).unwrap();
+
+        assert_eq!(
+            table.token_loc(&pool, 0).unwrap(),
+            TokenLoc {
+                block: table.blocks()[0],
+                slot: 0,
+            }
+        );
+        assert_eq!(
+            table.token_loc(&pool, 6).unwrap(),
+            TokenLoc {
+                block: table.blocks()[1],
+                slot: 2,
+            }
+        );
+        let tail = table.token_loc(&pool, 9).unwrap();
+        assert_eq!(tail.slot, 1);
+        pool.kv_mut(tail.block, tail.slot)
+            .unwrap()
+            .copy_from_slice(&[1.5, 2.5]);
+        assert_eq!(pool.kv(tail.block, tail.slot).unwrap(), &[1.5, 2.5]);
+        assert_eq!(
+            table.token_loc(&pool, 10).unwrap_err(),
+            AllocError::TokenOutOfRange { index: 10, len: 10 }
+        );
+
+        table.release(&mut pool).unwrap();
+        assert_eq!(pool.free_count(), pool.capacity());
     }
 
     #[test]
