@@ -1,45 +1,77 @@
 # paged-kv
 
-This crate tracks blocks for a paged KV cache, and it batches sequences first-come, first-served.
-
-You keep the tensors. A `BlockId` is an index into your own storage. The pool records which blocks are free, which sequence holds them, and how full each block is.
-
-Paging is for many sequences sharing one fixed pool, and for two sequences that start with the same prompt. One sequence whose length you already know is a simpler problem. [`ContiguousTable`](#one-contiguous-length) is that simpler problem, and the timings below show it is faster.
-
-## Try it
+This library keeps fixed-size blocks. A pool created with storage holds one `f32` vector in each token slot.
 
 ```sh
-cargo test
-cargo test -p paged-kv-py
-cargo bench --bench paged_vs_contiguous
-cargo bench --bench alloc_load
-cargo bench --bench scheduler_overhead
+cargo run --example fake_attention
 ```
 
-Each bench prints nanoseconds. The charts are one release run on an Intel i9-9900, rustc 1.99.1: 3 warmup runs, then the median of 21.
-
-## Reserve tokens for one sequence
+That prints five token ids, the block and slot each one landed in, a score per token, and a zero vector after the table is released. The scores are dot products of keys this crate derived from the token id. There is no tokenizer and no loaded model. The batcher does not call this step.
 
 ```rust
-use paged_kv::{BlockPool, BlockTable};
+use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
 
 fn main() -> Result<(), paged_kv::AllocError> {
-    let mut pool = BlockPool::new(128, 16);
+    let head_dim = 4;
+    let tokens = [7u32, 3, 9, 1, 4];
+    let mut pool = BlockPool::with_storage(4, 4, head_dim * 2);
     let mut table = BlockTable::new();
 
-    table.grow(&mut pool, 32)?; // prompt
-    table.grow(&mut pool, 33)?; // one decoded token
+    fill_tokens(&mut pool, &mut table, head_dim, &tokens)?;
+    let scores = attend(&pool, &table, head_dim, 4)?;
+    assert_eq!(scores.len(), tokens.len());
 
     table.release(&mut pool)?;
     Ok(())
 }
 ```
 
-`BlockPool::new(128, 16)` is 128 blocks of 16 token slots. `grow` extends the logical length. Crossing a block boundary takes a block from the free list. `release` gives the blocks back.
+`with_storage(4, 4, 8)` is 4 blocks, 4 token slots each, 8 floats per slot. The first half of a slot is K and the second half is V. `fill_tokens` grows the table and writes those halves. `release` gives the blocks back and zeroes the vectors. Dropping a table without `release` leaves the blocks marked in use until the pool is dropped.
 
-The table does not own the pool. Dropping a table without `release` leaves those blocks marked in use until the pool is dropped. The type is marked `must_use`.
+## Install the Python package
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install ./paged-kv-py
+```
+
+```python
+import paged_kv
+
+pool = paged_kv.BlockPool.with_storage(4, 2, 4)
+table = paged_kv.BlockTable()
+paged_kv.fill_tokens(pool, table, 2, [1, 2, 3])
+assert paged_kv.attend(pool, table, 2, 3) == [40.0, 60.0, 80.0]
+block, slot = table.token_loc(pool, 2)
+pool.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])
+table.release(pool)
+```
+
+`pip install` builds the extension. Failures raise `ValueError`. The same calls are covered by `a_python_caller_reserves_shares_and_preempts`.
+
+## Write your own vector
+
+```rust
+use paged_kv::{BlockPool, BlockTable};
+
+fn main() -> Result<(), paged_kv::AllocError> {
+    let mut pool = BlockPool::with_storage(8, 16, 4);
+    let mut table = BlockTable::new();
+    table.grow(&mut pool, 20)?;
+
+    let loc = table.token_loc(&pool, 19)?;
+    pool.kv_mut(loc.block, loc.slot)?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+    table.release(&mut pool)?;
+    Ok(())
+}
+```
+
+`token_loc` is the handle a forward pass writes through. A block another sequence still shares cannot be written in place. `cow` copies the filled slots into a private block first. `BlockPool::new` is the metadata-only pool used by the benches below. It has no vectors, and `kv_mut` returns an error.
 
 ## Batch a few sequences
+
+The scheduler queues requests and reserves blocks. It does not write KV vectors, and it does not call `attend`. Paging still matters here when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts below are that comparison, on an Intel i9-9900 with rustc 1.99.1.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
@@ -132,39 +164,21 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 There is no pool, no free list, and no sharing. `reserve_exact` sets the capacity to that length. `grow` without a reserve doubles capacity until the length fits, the way a normal buffer grows. `grow` does not shrink the span.
 
-## From Python
+## Run the checks
 
-The bindings live in `paged-kv-py` and wrap the same types. Build the extension and rename it so Python can import it:
+The Python module has the same scheduler. `preempt("pause")` keeps blocks. `preempt("recompute")` frees them.
 
 ```sh
-cargo build -p paged-kv-py
-mkdir -p /tmp/paged-kv-py
-cp target/debug/libpaged_kv.so /tmp/paged-kv-py/paged_kv.so
-PYTHONPATH=/tmp/paged-kv-py python3
+cargo test
+cargo test -p paged-kv-py
+cargo bench --bench paged_vs_contiguous
+cargo bench --bench alloc_load
+cargo bench --bench scheduler_overhead
 ```
-
-```python
-import paged_kv
-
-pool = paged_kv.BlockPool(128, 16)
-table = paged_kv.BlockTable()
-table.grow(pool, 32)
-table.grow(pool, 33)
-table.release(pool)
-
-sched = paged_kv.Scheduler(32, 16, 4)
-first = sched.add(32, 8)
-sched.admit()
-decoded, finished = sched.step()
-sched.preempt("recompute")  # "pause" keeps the blocks instead
-sched.retire()
-```
-
-`table.len` is the logical length. `preempt` takes the string `"pause"` or `"recompute"`. Failures raise `ValueError`. This is a thin wrapper around the Rust API, covered by `a_python_caller_reserves_shares_and_preempts`. It is not a serving client.
 
 ## What the timings say
 
-No KV bytes are copied. The numbers are the cost of updating lengths, free lists, and block ids.
+These benches call `BlockPool::new`, so they store no vectors and copy no KV bytes. The numbers are the cost of updating lengths, free lists, and block ids. Each chart is one release run on an Intel i9-9900, rustc 1.99.1: 3 warmup runs, then the median of 21.
 
 ![One token at a time, paged blocks take much longer than a doubling length. The ranges do not overlap.](docs/paged-vs-contiguous.svg)
 
@@ -204,14 +218,15 @@ The scheduler median is 1.44× the one-sequence loop, and every scheduler run is
 
 ## What these numbers leave out
 
-- The benches copy no KV bytes. A real decode step does, and that cost is not measured here.
+- The benches use the metadata pool. Filling the `f32` vectors, and the dot products in `attend`, are not in these timings.
 - Every sequence in the paged-versus-contiguous bench stays live at once. A pool that is filled, freed, and filled again over a long run is a different story. The allocate/free bench is the one that recycles, and it shows no clear saving.
 - Nothing in the benches shares a prefix. `PrefixCache` can avoid a second set of blocks. That saving is not in the timings.
 - The scheduler adds its own cost on top of paging. Head-of-line blocking and all-or-nothing steps are part of that design.
 
 ## What this is not
 
-- A model, a tokenizer, an attention kernel, or a KV tensor.
+- A trained model, a tokenizer, or a loader for someone else's weights. `attend` is a fixed function of the token id.
+- A GPU tensor, or fp16. Storage is one `f32` vector per token slot on the CPU.
 - A serving server, and not a client for one.
 - A multi-device cache.
 - Automatic prefix sharing. The cache is there. `Scheduler::admit` does not call it.
@@ -233,7 +248,7 @@ A fresh pool is stacked from high ids down to zero, so the first allocations are
 
 Blocks are interchangeable. A hole on the free list can be used by any request, so the pool has no external fragmentation. The waste it reports is internal: `block_size - used` on each live block, counted once even when several owners share it. An idle pool reports zero. A freshly allocated block starts at `used == 0`, so it counts as fully wasted until the caller fills it.
 
-`allocate` returns one block with refcount 1. `acquire` adds an owner. `free` drops one owner and recycles the block at zero. A second free of an already free block is rejected. `cow` returns the same id when the refcount is 1. When the block is shared, it allocates a new block, copies the initialized length, and drops one reference to the original. The caller copies KV bytes only when the returned id differs. If that allocation fails, the shared block is unchanged.
+`allocate` returns one block with refcount 1. `acquire` adds an owner. `free` drops one owner and recycles the block at zero. A second free of an already free block is rejected. `cow` returns the same id when the refcount is 1. When the block is shared, it allocates a new block, copies the initialized length, copies any stored vectors for those slots, and drops one reference to the original. If that allocation fails, the shared block is unchanged. Freeing the last owner zeroes a stored block.
 
 `BlockTable` holds one reference per block it lists. Full blocks are marked fully used. The tail holds the remainder. `grow` does not shorten a table. If the pool cannot cover the whole request, the table and the pool stay as they were.
 
@@ -282,7 +297,10 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Recompute frees blocks for the waiting prompt | `recompute_frees_blocks_so_a_waiting_prompt_can_fit` |
 | The oldest running sequence stays | `the_oldest_running_sequence_stays_when_a_newer_one_is_preempted` |
 | Prefix hit, miss, and rate | `a_miss_then_a_hit_shares_blocks_and_records_the_rate`, `a_cached_table_that_is_too_short_counts_as_a_miss` |
-| Python wrappers | `a_python_caller_reserves_shares_and_preempts` |
+| Stored vectors, zeroed on free, copied by `cow` | `stored_kv_is_writable_until_the_block_is_freed`, `cow_copies_stored_kv_and_leaves_the_other_owner_unchanged` |
+| A token index maps to a block and slot | `token_loc_maps_a_logical_index_onto_a_block_slot` |
+| `fill_tokens` then `attend`, and release zeroes the block | `fill_then_attend_reads_the_stored_keys_and_free_zeroes_them` |
+| Python install path, including `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |
 | Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |
