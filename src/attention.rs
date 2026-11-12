@@ -1,10 +1,10 @@
 //! One attention step over KV vectors stored in a [`BlockPool`](crate::BlockPool).
 //!
-//! K and V are a fixed function of a token id. There is no learned weight
-//! and no tokenizer. [`fill_tokens`] allocates blocks for those ids and
-//! writes the vectors. [`attend`] reads K back and returns a dot product
-//! per token. V is stored so a later step can see it. It is not multiplied
-//! in here.
+//! [`fill_tokens`] writes K and V from a fixed function of the token id.
+//! There is no learned weight and no tokenizer. [`attend`] does not use that
+//! function. It reads the stored vectors: the query is the last token's K,
+//! the scores are softmax over dots with every stored K, and the context is
+//! those weights applied to the stored V.
 
 use crate::{AllocError, BlockPool, BlockTable, TokenLoc};
 
@@ -44,26 +44,79 @@ pub fn write_token(
     Ok(())
 }
 
-/// Dot `query_token`'s K with every K stored in `table`, in token order.
+/// One attention step over the K and V stored in `table`.
+///
+/// The query is the last token's stored K. `scores` are softmax weights in
+/// token order and sum to 1. `context` is those weights applied to the
+/// stored V vectors. An empty table returns no scores and a zero context.
+/// Overwriting a stored vector changes the result. The token id is not read
+/// here.
 pub fn attend(
     pool: &BlockPool,
     table: &BlockTable,
     head_dim: u32,
-    query_token: u32,
-) -> Result<Vec<f32>, AllocError> {
-    let query = token_kv(pool, head_dim, query_token)?;
+) -> Result<Attention, AllocError> {
+    let width = pool.floats_per_token().ok_or(AllocError::NoStorage)?;
+    if head_dim == 0 || width != head_dim.saturating_mul(2) {
+        return Err(AllocError::KvWidth {
+            floats_per_token: width,
+            head_dim,
+        });
+    }
     let dim = head_dim as usize;
-    let mut scores = Vec::with_capacity(table.len() as usize);
+    if table.is_empty() {
+        return Ok(Attention {
+            scores: Vec::new(),
+            context: vec![0.0; dim],
+        });
+    }
+
+    let last = table.token_loc(pool, table.len() - 1)?;
+    let query = pool.kv(last.block, last.slot)?.to_vec();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut logits = Vec::with_capacity(table.len() as usize);
+    let mut max_logit = f32::NEG_INFINITY;
     for index in 0..table.len() {
         let loc = table.token_loc(pool, index)?;
         let kv = pool.kv(loc.block, loc.slot)?;
         let mut dot = 0.0f32;
-        for (q, k) in query.iter().zip(kv.iter()).take(dim) {
-            dot += q * k;
+        for i in 0..dim {
+            dot += query[i] * kv[i];
         }
-        scores.push(dot);
+        let logit = dot * scale;
+        max_logit = max_logit.max(logit);
+        logits.push(logit);
     }
-    Ok(scores)
+
+    let mut scores = Vec::with_capacity(logits.len());
+    let mut sum = 0.0f32;
+    for logit in &logits {
+        let weight = (logit - max_logit).exp();
+        scores.push(weight);
+        sum += weight;
+    }
+    for weight in &mut scores {
+        *weight /= sum;
+    }
+
+    let mut context = vec![0.0; dim];
+    for (index, weight) in scores.iter().copied().enumerate() {
+        let loc = table.token_loc(pool, index as u32)?;
+        let kv = pool.kv(loc.block, loc.slot)?;
+        for i in 0..dim {
+            context[i] += weight * kv[dim + i];
+        }
+    }
+    Ok(Attention { scores, context })
+}
+
+/// Softmax weights and the mixed value vector from [`attend`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attention {
+    /// Weight of each token, in order. Empty when the table is empty.
+    pub scores: Vec<f32>,
+    /// Weighted sum of stored V. Length is the head dimension.
+    pub context: Vec<f32>,
 }
 
 fn token_kv(pool: &BlockPool, head_dim: u32, token_id: u32) -> Result<Vec<f32>, AllocError> {
@@ -104,10 +157,41 @@ mod tests {
             pool.kv(tail.block, tail.slot).unwrap(),
             &[4.0, 8.0, 2.0, 4.0]
         );
-        assert_eq!(
-            attend(&pool, &table, head_dim, 3).unwrap(),
-            vec![40.0, 60.0, 80.0]
-        );
+        let step = attend(&pool, &table, head_dim).unwrap();
+        assert_eq!(step.scores.len(), 3);
+        assert_eq!(step.context.len(), head_dim as usize);
+        let weight_sum: f32 = step.scores.iter().sum();
+        assert!((weight_sum - 1.0).abs() < 1e-5);
+        assert!(step.scores[2] > step.scores[1] && step.scores[1] > step.scores[0]);
+
+        let first = table.token_loc(&pool, 0).unwrap();
+        {
+            let row = pool.kv_mut(first.block, first.slot).unwrap();
+            row[0] = 50.0;
+            row[1] = 50.0;
+        }
+        let raised = attend(&pool, &table, head_dim).unwrap();
+        assert!(raised.scores[0] > step.scores[0]);
+        assert!(raised.scores[0] > raised.scores[2]);
+
+        {
+            let row = pool.kv_mut(first.block, first.slot).unwrap();
+            row[0] = 2.0;
+            row[1] = 4.0;
+            row[2] = 1.0;
+            row[3] = 2.0;
+        }
+        let last = table.token_loc(&pool, 2).unwrap();
+        {
+            let row = pool.kv_mut(last.block, last.slot).unwrap();
+            row[2] = 10.0;
+            row[3] = 10.0;
+        }
+        let valued = attend(&pool, &table, head_dim).unwrap();
+        for (before, after) in step.scores.iter().zip(&valued.scores) {
+            assert!((before - after).abs() < 1e-5);
+        }
+        assert_ne!(step.context, valued.context);
 
         let blocks = table.blocks().to_vec();
         table.release(&mut pool).unwrap();

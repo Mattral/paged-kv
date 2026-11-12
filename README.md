@@ -6,7 +6,7 @@ This library keeps fixed-size blocks. A pool created with storage holds one `f32
 cargo run --example fake_attention
 ```
 
-That prints five token ids, the block and slot each one landed in, a score per token, and a zero vector after the table is released. The scores are dot products of keys this crate derived from the token id. There is no tokenizer and no loaded model. A scheduler whose pool stores vectors runs this same step on admission and on every token it appends. A metadata pool does not.
+That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. There is no tokenizer and no loaded model. A scheduler whose pool stores vectors runs this same step on admission and on every token it appends. A metadata pool does not.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -18,8 +18,9 @@ fn main() -> Result<(), paged_kv::AllocError> {
     let mut table = BlockTable::new();
 
     fill_tokens(&mut pool, &mut table, head_dim, &tokens)?;
-    let scores = attend(&pool, &table, head_dim, 4)?;
-    assert_eq!(scores.len(), tokens.len());
+    let attention = attend(&pool, &table, head_dim)?;
+    assert_eq!(attention.scores.len(), tokens.len());
+    assert_eq!(attention.context.len(), head_dim as usize);
 
     table.release(&mut pool)?;
     Ok(())
@@ -41,7 +42,9 @@ import paged_kv
 pool = paged_kv.BlockPool.with_storage(4, 2, 4)
 table = paged_kv.BlockTable()
 paged_kv.fill_tokens(pool, table, 2, [1, 2, 3])
-assert paged_kv.attend(pool, table, 2, 3) == [40.0, 60.0, 80.0]
+scores, context = paged_kv.attend(pool, table, 2)
+assert len(scores) == 3 and abs(sum(scores) - 1.0) < 1e-5
+assert len(context) == 2
 block, slot = table.token_loc(pool, 2)
 pool.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])
 table.release(pool)
@@ -218,14 +221,14 @@ The scheduler median is 1.44× the one-sequence loop, and every scheduler run is
 
 ## What these numbers leave out
 
-- The benches use the metadata pool. Filling the `f32` vectors, and the dot products in `attend`, are not in these timings.
+- The benches use the metadata pool. Filling the `f32` vectors, and the attention step, are not in these timings.
 - Every sequence in the paged-versus-contiguous bench stays live at once. A pool that is filled, freed, and filled again over a long run is a different story. The allocate/free bench is the one that recycles, and it shows no clear saving.
 - Nothing in the benches shares a prefix. `PrefixCache` can avoid a second set of blocks. That saving is not in the timings.
 - The scheduler adds its own cost on top of paging. Head-of-line blocking and all-or-nothing steps are part of that design.
 
 ## What this is not
 
-- A trained model, a tokenizer, or a loader for someone else's weights. `attend` is a fixed function of the token id.
+- A trained model, a tokenizer, or a loader for someone else's weights. The vector written for a token id is a fixed embedding. `attend` reads the stored K and V.
 - A GPU tensor, or fp16. Storage is one `f32` vector per token slot on the CPU.
 - A serving server, and not a client for one.
 - A multi-device cache.
@@ -299,7 +302,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Prefix hit, miss, and rate | `a_miss_then_a_hit_shares_blocks_and_records_the_rate`, `a_cached_table_that_is_too_short_counts_as_a_miss` |
 | Stored vectors, zeroed on free, copied by `cow` | `stored_kv_is_writable_until_the_block_is_freed`, `cow_copies_stored_kv_and_leaves_the_other_owner_unchanged` |
 | A token index maps to a block and slot | `token_loc_maps_a_logical_index_onto_a_block_slot` |
-| `fill_tokens` then `attend`, and release zeroes the block | `fill_then_attend_reads_the_stored_keys_and_free_zeroes_them` |
+| `attend` reads stored K and V, and release zeroes the block | `fill_then_attend_reads_the_stored_keys_and_free_zeroes_them` |
 | A scheduled generation writes non-zero KV and then releases it | `a_generation_loop_writes_nonzero_kv` |
 | Python install path, including `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |

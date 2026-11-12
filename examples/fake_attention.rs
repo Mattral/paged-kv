@@ -1,4 +1,4 @@
-//! Fill a few token slots and score them.
+//! Fill a few token slots, score the stored vectors, and show a key change.
 //!
 //! Run with `cargo run --example fake_attention --quiet`.
 
@@ -20,11 +20,19 @@ fn main() -> Result<(), paged_kv::AllocError> {
         );
     }
 
-    let scores = attend(&pool, &table, head_dim, *tokens.last().unwrap())?;
-    println!(
-        "scores against token {}: {scores:?}",
-        tokens.last().unwrap()
-    );
+    let before = attend(&pool, &table, head_dim)?;
+    println!("scores: {:?}", before.scores);
+    println!("context: {:?}", before.context);
+
+    let first = table.token_loc(&pool, 0)?;
+    let mut row = pool.kv(first.block, first.slot)?.to_vec();
+    for value in &mut row[..head_dim as usize] {
+        *value = 100.0;
+    }
+    pool.kv_mut(first.block, first.slot)?.copy_from_slice(&row);
+    let after = attend(&pool, &table, head_dim)?;
+    println!("scores after raising the first key: {:?}", after.scores);
+    assert!(after.scores[0] > before.scores[0]);
 
     let tail = *table.blocks().last().expect("fill allocated a block");
     table.release(&mut pool)?;

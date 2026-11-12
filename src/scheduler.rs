@@ -34,8 +34,10 @@ struct KvTrack {
     prompts: HashMap<SequenceId, Vec<u32>>,
     /// Ids written into slots, prompt first, then generated tokens.
     written: HashMap<SequenceId, Vec<u32>>,
-    /// Last [`attend`](crate::attend) output for a sequence that holds blocks.
+    /// Last softmax weights for a sequence that holds blocks.
     scores: HashMap<SequenceId, Vec<f32>>,
+    /// Last mixed V vector for that same step.
+    context: HashMap<SequenceId, Vec<f32>>,
 }
 
 /// What happens to a sequence taken out of the batch by [`Scheduler::preempt`].
@@ -118,6 +120,7 @@ impl Scheduler {
                     prompts: HashMap::new(),
                     written: HashMap::new(),
                     scores: HashMap::new(),
+                    context: HashMap::new(),
                 })
             }
         });
@@ -196,11 +199,18 @@ impl Scheduler {
 
     /// Last attention scores for `id`.
     ///
-    /// One score per token currently in the sequence. `None` on the same
-    /// conditions as [`Scheduler::token_ids`]. An empty prompt has no scores
-    /// until the first generated token is written.
+    /// Softmax weights, one per token currently in the sequence. `None` on
+    /// the same conditions as [`Scheduler::token_ids`]. An empty prompt has
+    /// an empty score list until the first generated token is written.
     pub fn scores(&self, id: SequenceId) -> Option<&[f32]> {
         self.kv.as_ref()?.scores.get(&id).map(Vec::as_slice)
+    }
+
+    /// Last attention context for `id`: the scores applied to stored V.
+    ///
+    /// `None` on the same conditions as [`Scheduler::scores`].
+    pub fn context(&self, id: SequenceId) -> Option<&[f32]> {
+        self.kv.as_ref()?.context.get(&id).map(Vec::as_slice)
     }
 
     /// Move waiting sequences into the batch, oldest first.
@@ -237,21 +247,19 @@ impl Scheduler {
                     self.waiting.push_front(seq);
                     return Err(err);
                 }
-                let scores = match tokens.last().copied() {
-                    None => Vec::new(),
-                    Some(query) => match attend(&self.pool, seq.table(), head_dim, query) {
-                        Ok(scores) => scores,
-                        Err(err) => {
-                            let _ = seq.discard_progress(&mut self.pool);
-                            self.waiting.push_front(seq);
-                            return Err(err);
-                        }
-                    },
+                let attention = match attend(&self.pool, seq.table(), head_dim) {
+                    Ok(attention) => attention,
+                    Err(err) => {
+                        let _ = seq.discard_progress(&mut self.pool);
+                        self.waiting.push_front(seq);
+                        return Err(err);
+                    }
                 };
                 let id = seq.id();
                 let kv = self.kv.as_mut().expect("storage head was checked");
                 kv.written.insert(id, tokens);
-                kv.scores.insert(id, scores);
+                kv.scores.insert(id, attention.scores);
+                kv.context.insert(id, attention.context);
             } else if let Err(err) = seq.allocate_prompt(&mut self.pool) {
                 self.waiting.push_front(seq);
                 return Err(err);
@@ -284,6 +292,7 @@ impl Scheduler {
             if let Some(kv) = self.kv.as_mut() {
                 kv.written.remove(&id);
                 kv.scores.remove(&id);
+                kv.context.remove(&id);
             }
         } else {
             seq.pause();
@@ -333,13 +342,14 @@ impl Scheduler {
                     .saturating_add(1);
                 let loc = seq.token_loc(block_size, seq.len() - 1)?;
                 write_token(&mut self.pool, loc, head_dim, next_id)?;
-                let scores = attend(&self.pool, seq.table(), head_dim, next_id)?;
+                let attention = attend(&self.pool, seq.table(), head_dim)?;
                 let kv = self.kv.as_mut().expect("storage head was checked");
                 kv.written
                     .get_mut(&id)
                     .expect("admission recorded the prompt ids")
                     .push(next_id);
-                kv.scores.insert(id, scores);
+                kv.scores.insert(id, attention.scores);
+                kv.context.insert(id, attention.context);
             }
             decoded.push(id);
             if done {
@@ -369,6 +379,7 @@ impl Scheduler {
                 kv.prompts.remove(&id);
                 kv.written.remove(&id);
                 kv.scores.remove(&id);
+                kv.context.remove(&id);
             }
             if let Err(err) = seq.release(&mut self.pool) {
                 if error.is_none() {
@@ -640,6 +651,7 @@ mod tests {
         assert_eq!(sched.admit().unwrap(), vec![id]);
         assert_eq!(sched.token_ids(id).unwrap(), &[1, 2, 3]);
         assert_eq!(sched.scores(id).unwrap().len(), 3);
+        assert_eq!(sched.context(id).unwrap().len(), head_dim as usize);
 
         let step = sched.step().unwrap();
         assert!(step.finished.is_empty());

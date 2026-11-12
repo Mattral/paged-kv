@@ -17,7 +17,7 @@ mod prefix_cache;
 mod scheduler;
 mod sequence;
 
-pub use attention::{attend, fill_tokens, write_token};
+pub use attention::{attend, fill_tokens, write_token, Attention};
 pub use contiguous::ContiguousTable;
 pub use prefix_cache::PrefixCache;
 pub use scheduler::{DecodeStep, PreemptError, PreemptPolicy, Scheduler};

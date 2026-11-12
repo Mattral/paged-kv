@@ -325,15 +325,13 @@ fn fill_tokens(
         .map_err(alloc_err)
 }
 
-/// Dot `query_token`'s K with every stored K, in token order.
+/// Softmax weights over stored K, and the weighted sum of stored V.
+///
+/// Returns `(scores, context)`. The query is the last token's stored K.
 #[pyfunction]
-fn attend(
-    pool: &BlockPool,
-    table: &BlockTable,
-    head_dim: u32,
-    query_token: u32,
-) -> PyResult<Vec<f32>> {
-    ::paged_kv::attend(&pool.inner, &table.inner, head_dim, query_token).map_err(alloc_err)
+fn attend(pool: &BlockPool, table: &BlockTable, head_dim: u32) -> PyResult<(Vec<f32>, Vec<f32>)> {
+    let step = ::paged_kv::attend(&pool.inner, &table.inner, head_dim).map_err(alloc_err)?;
+    Ok((step.scores, step.context))
 }
 
 /// Paged KV blocks, stored f32 vectors, and an FCFS batcher.
@@ -419,7 +417,10 @@ stored = paged_kv.BlockPool.with_storage(4, 2, 4)
 seq = paged_kv.BlockTable()
 paged_kv.fill_tokens(stored, seq, 2, [1, 2, 3])
 assert seq.len == 3
-assert paged_kv.attend(stored, seq, 2, 3) == [40.0, 60.0, 80.0]
+scores, context = paged_kv.attend(stored, seq, 2)
+assert len(scores) == 3 and abs(sum(scores) - 1.0) < 1e-5
+assert scores[2] > scores[1] > scores[0]
+assert len(context) == 2
 block, slot = seq.token_loc(stored, 2)
 assert stored.kv(block, slot) == [4.0, 8.0, 2.0, 4.0]
 stored.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])

@@ -1,6 +1,6 @@
 [package]
 name = "paged-kv-py"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Python bindings for the paged-kv block pool and scheduler"
 publish = false

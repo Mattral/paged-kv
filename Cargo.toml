@@ -1,8 +1,8 @@
 [package]
 name = "paged-kv"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "Paged KV blocks with stored f32 vectors, FCFS batching, and a tiny attention step"
+description = "Paged KV blocks with stored f32 vectors, FCFS batching, and attention over those vectors"
 readme = "README.md"
 
 [workspace]
