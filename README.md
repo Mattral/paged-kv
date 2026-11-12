@@ -74,7 +74,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Batch a few sequences
 
-The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. A metadata pool does not, and that is what the charts measure. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts are that comparison, on an Intel i9-9900 with rustc 1.99.1.
+The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. `cargo run --example scheduled_attention` does that for token ids `[1, 2, 3, 4]` and prints the scores. A metadata pool does not, and that is what the charts measure. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts are that comparison, on an Intel i9-9900 with rustc 1.99.1.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
