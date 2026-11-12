@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="320" viewBox="0 0 760 320" role="img">
+  <title>Doubling reserves more slots than paging. Exact reserve reserves none extra.</title>
+  <desc>Per sequence, for a logical length of 260 tokens. Exact reserve holds 260. Paged blocks of size 16 hold 272. Contiguous doubling holds 512.</desc>
+  <rect width="760" height="320" rx="12" fill="#ffffff" stroke="#e6e8ee"/>
+  <text x="32" y="36" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="600">Paging wastes a tail. Doubling wastes more.</text>
+  <text x="32" y="58" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Slots reserved for one sequence of 260 tokens. These counts do not depend on the timer.</text>
+
+  <!-- 0 at x=32, 600 slots at x=720 -->
+  <text x="32" y="96" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Exact reserve</text>
+  <rect x="32" y="106" width="688" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="106" width="298.1" height="26" rx="4" fill="#59a14f"/>
+  <text x="340" y="124" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">260</text>
+
+  <text x="32" y="156" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Paged, block size 16</text>
+  <rect x="32" y="166" width="688" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="166" width="311.9" height="26" rx="4" fill="#e45756"/>
+  <text x="354" y="184" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">272 (+12 tail)</text>
+
+  <text x="32" y="216" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Contiguous, capacity doubles</text>
+  <rect x="32" y="226" width="688" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="226" width="587.3" height="26" rx="4" fill="#4c78a8"/>
+  <text x="500" y="244" fill="#ffffff" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">512</text>
+
+  <g fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+    <line x1="32" y1="266" x2="720" y2="266" stroke="#d5d9e0"/>
+    <line x1="32" y1="266" x2="32" y2="272" stroke="#8b93a0"/>
+    <line x1="261.3" y1="266" x2="261.3" y2="272" stroke="#8b93a0"/>
+    <line x1="490.7" y1="266" x2="490.7" y2="272" stroke="#8b93a0"/>
+    <line x1="720" y1="266" x2="720" y2="272" stroke="#8b93a0"/>
+    <text x="32" y="290" text-anchor="start">0</text>
+    <text x="261.3" y="290" text-anchor="middle">200</text>
+    <text x="490.7" y="290" text-anchor="middle">400</text>
+    <text x="720" y="290" text-anchor="end">600 slots</text>
+  </g>
+</svg>

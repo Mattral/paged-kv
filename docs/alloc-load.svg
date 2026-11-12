@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="280" viewBox="0 0 760 280" role="img">
+  <title>Recycling the free list stays in the same cost band as the first fill</title>
+  <desc>100,000 blocks. Fresh fill and drain median 6.56 ns per block, range 6.08 to 10.85. Recycled free list median 5.62 ns per block, range 5.41 to 9.07. The ranges overlap.</desc>
+  <rect width="760" height="280" rx="12" fill="#ffffff" stroke="#e6e8ee"/>
+  <text x="32" y="36" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="600">Recycling the pool stays in the same band</text>
+  <text x="32" y="58" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Allocate, mark full, and free 100,000 blocks. Whiskers overlap, so reuse is not a clear win.</text>
+
+  <!-- 0 at x=32, 12 ns at x=720 -->
+  <text x="32" y="96" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">First fill</text>
+  <rect x="32" y="106" width="688" height="28" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="106" width="375.9" height="28" rx="4" fill="#4c78a8"/>
+  <line x1="380.8" y1="120" x2="654" y2="120" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="380.8" y1="112" x2="380.8" y2="128" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="654" y1="112" x2="654" y2="128" stroke="#1a1a1a" stroke-width="2"/>
+  <text x="250" y="125" fill="#ffffff" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">6.6 ns</text>
+
+  <text x="32" y="162" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Second pass, warm free list</text>
+  <rect x="32" y="172" width="688" height="28" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="172" width="322.2" height="28" rx="4" fill="#f28e2b"/>
+  <line x1="342.1" y1="186" x2="551.9" y2="186" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="342.1" y1="178" x2="342.1" y2="194" stroke="#1a1a1a" stroke-width="2"/>
+  <line x1="551.9" y1="178" x2="551.9" y2="194" stroke="#1a1a1a" stroke-width="2"/>
+  <text x="200" y="191" fill="#ffffff" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">5.6 ns</text>
+
+  <g fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+    <line x1="32" y1="214" x2="720" y2="214" stroke="#d5d9e0"/>
+    <line x1="32" y1="214" x2="32" y2="220" stroke="#8b93a0"/>
+    <line x1="261.3" y1="214" x2="261.3" y2="220" stroke="#8b93a0"/>
+    <line x1="490.7" y1="214" x2="490.7" y2="220" stroke="#8b93a0"/>
+    <line x1="720" y1="214" x2="720" y2="220" stroke="#8b93a0"/>
+    <text x="32" y="238" text-anchor="start">0</text>
+    <text x="261.3" y="238" text-anchor="middle">4</text>
+    <text x="490.7" y="238" text-anchor="middle">8</text>
+    <text x="720" y="238" text-anchor="end">12 ns / block</text>
+  </g>
+</svg>

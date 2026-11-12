@@ -4,9 +4,38 @@ A Rust block pool for a paged KV cache, and a first-come, first-served continuou
 
 The pool does not store tensors. The caller owns the KV bytes and addresses them with a `BlockId`. The scheduler does not run a model. It queues sequences, reserves prompt blocks, appends one fake decode token at a time, and retires finished sequences.
 
-## Measured bookkeeping
+## Paged metadata is slower than a contiguous span
 
-`cargo bench --bench scheduler_overhead` times the scheduler against a loop that runs the same prompts and decode tokens one sequence at a time. Both paths use the paged pool. This is not model throughput, and it is not a comparison with contiguous KV storage.
+No KV bytes are copied. The charts compare bookkeeping only, on Linux WSL2, an i9-9900, rustc 1.99.1. Each timed figure is the median of 21 release runs after 3 warmup runs.
+
+![Paged growth is a long bar. Contiguous doubling is a short one. Their ranges do not overlap.](docs/paged-vs-contiguous.svg)
+
+512 sequences grow to 260 tokens, one token at a time, and stay live together. The paged median is 5.42 ms. The contiguous doubling median is 0.25 ms. That is about 22×. The slowest doubling run (0.41 ms) is still well under the fastest paged run (5.19 ms).
+
+![Exact reserve holds 260 slots, paging holds 272, and doubling holds 512.](docs/reserved-slots.svg)
+
+The time win for doubling is not a memory win. A doubling buffer for 260 tokens lands on 512 slots. Paged blocks of 16 land on 272, twelve of them unused. An exact reserve stays at 260. So paging is tighter than geometric growth and looser than knowing the length up front.
+
+Reserving the whole 260 in one call, instead of stepping, drops the paged median to 0.83 ms (min 0.81, max 1.08). The contiguous exact path is a capacity write: median 2.8 µs. One sample spiked to 20 µs, and that spike is still below every paged sample. About 290× at the medians. This is not the decode loop. It is the cost of walking the block pool once per sequence.
+
+| Policy | min | median | max |
+| --- | --- | --- | --- |
+| Contiguous, double each token | 0.249 ms | 0.250 ms | 0.413 ms |
+| Paged, one token at a time | 5.188 ms | 5.423 ms | 6.434 ms |
+| Contiguous, exact reserve | 2.7 µs | 2.8 µs | 19.8 µs |
+| Paged, one `grow` to 260 | 0.810 ms | 0.829 ms | 1.080 ms |
+
+`cargo bench --bench paged_vs_contiguous` prints the nanoseconds behind this table.
+
+## Recycling blocks stays in the same band
+
+![The first fill and a recycled free list have overlapping whiskers around 6 ns per block.](docs/alloc-load.svg)
+
+`cargo bench --bench alloc_load` fills 100,000 blocks, marks each one full, and frees them. Pool construction is outside the timer. The first pass is 6.6 ns per block at the median (6.1 to 10.8). The second pass, on a warm free list, is 5.6 ns (5.4 to 9.1). The ranges overlap, so recycling is not a clear saving and not a penalty either.
+
+## Scheduler queue versus one sequence
+
+`cargo bench --bench scheduler_overhead` times the scheduler against a loop that runs the same prompts and decode tokens one sequence at a time. Both paths use the paged pool. This is not model throughput.
 
 ![The scheduler bar is longer, and its whole range sits to the right of the slowest one-sequence run](docs/scheduler-overhead.svg)
 
@@ -26,6 +55,7 @@ The chart is drawn from this run:
 - `BlockPool` allocates fixed-size blocks, recycles them from a free list, counts owners, and copy-on-writes a shared block.
 - `BlockTable` maps a token length onto blocks and can fork a prefix.
 - `Sequence` splits that length into prompt tokens and generated tokens (`prompt_and_generated_tokens_share_one_table`).
+- `ContiguousTable` is the non-paged baseline: one length and one capacity (`grow_doubles_capacity_until_the_length_fits`, `reserve_exact_does_not_double_past_the_request`).
 - `Scheduler` admits in arrival order, steps the batch, and retires finished sequences (`step_then_retire_frees_blocks_and_admits_the_next_sequence`, `fake_generation_joins_sequences_and_frees_every_block`).
 
 `cargo test` covers the behavior named below.
@@ -40,8 +70,17 @@ The chart is drawn from this run:
 - A prompt that does not fit is not skipped. Smaller requests behind it wait (`a_prompt_that_does_not_fit_blocks_smaller_requests_behind_it`).
 - A finished sequence keeps its batch slot until `retire` (`a_finished_sequence_keeps_its_slot_until_retire`).
 - `step` grows every decoding sequence or none of them (`step_is_all_or_nothing_when_the_batch_cannot_grow`).
-- The benchmark above does not say whether paging is faster than one contiguous buffer per sequence.
+- The paged-versus-contiguous bench does not move KV bytes, does not share prefixes, and does not run sequences one after another. A fixed pool that is reused over time is not what those timings show.
 - No multi-device cache.
+
+## Where paging costs more
+
+- Stepping one token at a time touches the free list, the used-slot array, and release. A contiguous length does not. That is the 22× gap above.
+- Even one `grow` to the full length still allocates every block. An exact reserve writes one integer.
+- The tail of a partial block is empty slots. At block size 16 and length 260, that is 12 slots per sequence. Doubling can waste more than that. Exact reserve wastes none.
+- Owners, copy-on-write, and `release` are extra rules. Dropping a table without `release` leaks references. A `ContiguousTable` does not borrow from a pool.
+- The scheduler adds another cost on top of paging. Its median was 1.44× a one-sequence loop that already used the paged pool. Head-of-line blocking and all-or-nothing steps are part of that design, not of the contiguous baseline.
+- Prefix sharing can avoid a second copy. Nothing in these benches shares a prefix, so that benefit is not a measured saving.
 
 Dropping a `BlockTable` or a `Sequence` that holds blocks, without `release`, leaks those references until the pool is dropped. The table type is marked `must_use`. The tests release what they allocate.
 
@@ -107,11 +146,28 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 }
 ```
 
-## Tests and the benchmark
+## What a Python caller would do
+
+PyO3 bindings are not implemented. Nothing here imports. The call order a binding would expose is the same as the Rust API:
+
+```python
+pool = BlockPool(num_blocks=128, block_size=16)
+table = BlockTable()
+table.grow(pool, prompt_len)
+while table.len < prompt_len + max_new_tokens:
+    table.grow(pool, table.len + 1)
+table.release(pool)
+```
+
+`ContiguousTable` would skip the pool and call `reserve_exact` or `grow` on the table alone.
+
+## Tests and benchmarks
 
 ```sh
 cargo test
+cargo bench --bench paged_vs_contiguous
+cargo bench --bench alloc_load
 cargo bench --bench scheduler_overhead
 ```
 
-The benchmark prints nanoseconds. The table above is one release run on the host named in Measured bookkeeping. A non-paged baseline is not in this crate yet.
+Each bench prints nanoseconds. The charts and tables above are one release run on this WSL host.
