@@ -334,6 +334,28 @@ fn attend(pool: &BlockPool, table: &BlockTable, head_dim: u32) -> PyResult<(Vec<
     Ok((step.scores, step.context))
 }
 
+/// Byte ids for `text`. Token `b` is the raw byte `b`.
+#[pyfunction]
+fn encode(text: &str) -> Vec<u32> {
+    ::paged_kv::encode(text)
+}
+
+/// Text for `ids`. Ids outside a byte are skipped.
+#[pyfunction]
+fn decode(ids: Vec<u32>) -> String {
+    ::paged_kv::decode(&ids)
+}
+
+/// Run the fixed block on `text`.
+///
+/// Returns `(ids, text)`. `ids` starts with the byte ids of `text`, then up
+/// to `max_new_tokens` ids the block chose. `text` is those ids decoded.
+#[pyfunction]
+fn generate(text: &str, max_new_tokens: u32) -> PyResult<(Vec<u32>, String)> {
+    let generated = ::paged_kv::generate(text, max_new_tokens).map_err(alloc_err)?;
+    Ok((generated.ids, generated.text))
+}
+
 /// Paged KV blocks, stored f32 vectors, and an FCFS batcher.
 #[pymodule]
 fn paged_kv(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -344,6 +366,9 @@ fn paged_kv(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Scheduler>()?;
     module.add_function(wrap_pyfunction!(fill_tokens, module)?)?;
     module.add_function(wrap_pyfunction!(attend, module)?)?;
+    module.add_function(wrap_pyfunction!(encode, module)?)?;
+    module.add_function(wrap_pyfunction!(decode, module)?)?;
+    module.add_function(wrap_pyfunction!(generate, module)?)?;
     Ok(())
 }
 
@@ -427,6 +452,15 @@ stored.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])
 assert stored.kv(block, slot) == [9.0, 9.0, 9.0, 9.0]
 seq.release(stored)
 assert stored.free_count() == stored.capacity()
+
+assert paged_kv.encode('hi') == [104, 105]
+assert paged_kv.decode([104, 256, 105]) == 'hi'
+ids, text = paged_kv.generate('hi', 2)
+assert ids == [104, 105, 34, 7]
+assert text == paged_kv.decode(ids)
+assert ids[2:] != [106, 107]
+ids, text = paged_kv.generate('hi', 0)
+assert ids == [104, 105] and text == 'hi'
 ",
                 None,
                 None,

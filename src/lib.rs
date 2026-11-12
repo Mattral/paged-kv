@@ -9,7 +9,8 @@
 //! [`BlockPool::with_storage`] also keeps one `f32` vector per token slot,
 //! addressed by [`BlockId`]. On that pool, admission and each decode step
 //! write K and V from [`TinyModel`] and take the next token from that block.
-//! [`encode`] and [`decode`] map text to bytes and back. [`ContiguousTable`]
+//! [`encode`] and [`decode`] map text to bytes and back. [`generate`] runs
+//! that block on a string and returns the ids it appended. [`ContiguousTable`]
 //! is the non-paged baseline: one length and one capacity, with no blocks.
 
 mod attention;
@@ -23,7 +24,7 @@ mod tokenizer;
 pub use attention::{attend, fill_tokens, write_token, Attention};
 pub use contiguous::ContiguousTable;
 pub use prefix_cache::PrefixCache;
-pub use scheduler::{DecodeStep, PreemptError, PreemptPolicy, Scheduler};
+pub use scheduler::{generate, DecodeStep, Generated, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
 pub use tiny_model::{ModelForward, TinyModel};
 pub use tokenizer::{decode, encode, EOS, VOCAB_SIZE};

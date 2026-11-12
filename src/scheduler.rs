@@ -85,6 +85,15 @@ impl std::error::Error for PreemptError {
     }
 }
 
+/// Token ids and text from one run of the fixed block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generated {
+    /// Prompt bytes, then the ids the block appended.
+    pub ids: Vec<u32>,
+    /// [`decode`](crate::decode) of [`Generated::ids`].
+    pub text: String,
+}
+
 /// One decode step over the running batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeStep {
@@ -510,6 +519,45 @@ fn forward_tokens(
     model.forward(tokens, &rows)
 }
 
+/// Encode `text`, run the fixed block, and decode the ids it produced.
+///
+/// The block dimension is 2, the same width as `scheduled_attention`.
+/// At most `max_new_tokens` ids are appended. [`EOS`] stops the loop early.
+/// The pool is released before this returns.
+///
+/// # Panics
+/// Panics if the prompt length or the full length does not fit in `u32`.
+pub fn generate(text: &str, max_new_tokens: u32) -> Result<Generated, AllocError> {
+    const HEAD_DIM: u32 = 2;
+    const BLOCK_SIZE: u32 = 16;
+    let prompt = crate::encode(text);
+    let prompt_len = u32::try_from(prompt.len()).expect("prompt length fits in u32");
+    let total = prompt_len
+        .checked_add(max_new_tokens)
+        .expect("generation length fits in u32");
+    let blocks = BlockPool::blocks_needed(total, BLOCK_SIZE).max(1);
+    let mut sched = Scheduler::new(BlockPool::with_storage(blocks, BLOCK_SIZE, HEAD_DIM * 2), 1);
+    let id = sched.add_tokens(&prompt, max_new_tokens);
+    sched.admit()?;
+    for _ in 0..max_new_tokens {
+        let still_decoding = sched
+            .running()
+            .iter()
+            .any(|seq| seq.id() == id && seq.phase() == Phase::Decoding);
+        if !still_decoding {
+            break;
+        }
+        sched.step()?;
+    }
+    let ids = sched
+        .token_ids(id)
+        .expect("admission wrote the prompt")
+        .to_vec();
+    let decoded = crate::decode(&ids);
+    sched.retire()?;
+    Ok(Generated { ids, text: decoded })
+}
+
 fn blocks_for_one_more_token(len: u32, block_size: u32) -> u32 {
     let next = len.checked_add(1).expect("sequence length fits in u32");
     BlockPool::blocks_needed(next, block_size) - BlockPool::blocks_needed(len, block_size)
@@ -826,5 +874,35 @@ mod tests {
         assert!(sched.running().is_empty());
         assert_eq!(sched.next_waiting().unwrap().id(), id);
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+    }
+
+    #[test]
+    fn generate_appends_ids_from_the_block() {
+        let text = "hi";
+        let out = generate(text, 2).unwrap();
+        let prompt = crate::encode(text);
+        assert_eq!(&out.ids[..prompt.len()], prompt.as_slice());
+        assert_eq!(out.text, crate::decode(&out.ids));
+        assert_eq!(out.ids, vec![104, 105, 34, 7]);
+
+        let model = TinyModel::new(2);
+        let mut expected = prompt;
+        for _ in 0..2 {
+            let rows: Vec<Vec<f32>> = expected
+                .iter()
+                .copied()
+                .map(|token| model.kv(token).unwrap())
+                .collect();
+            let next = model.forward(&expected, &rows).unwrap().next_token;
+            expected.push(next);
+            if next == EOS {
+                break;
+            }
+        }
+        assert_eq!(out.ids, expected);
+
+        let prompt_only = generate(text, 0).unwrap();
+        assert_eq!(prompt_only.ids, crate::encode(text));
+        assert_eq!(prompt_only.text, text);
     }
 }

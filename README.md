@@ -6,7 +6,7 @@ This library keeps fixed-size blocks. A pool created with storage holds one `f32
 cargo run --example fake_attention
 ```
 
-That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. One fixed-weight block in this repo chooses the next id on a storage pool. It is not trained, and it does not load anyone else's weights. A metadata pool does not run it.
+That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. `generate` runs one fixed-weight block on that text and returns the ids it appended. The block is not trained, and it does not load anyone else's weights. A metadata pool does not run it.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -31,10 +31,28 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Install the Python package
 
+From a clean virtualenv, in this repo:
+
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install ./paged-kv-py
+.venv/bin/python -c 'import paged_kv; print(paged_kv.encode("hi")); print(paged_kv.generate("hi", 2))'
 ```
+
+That prints the byte ids of `"hi"`, then the same ids plus the two the block appended, and the decoded text. `cargo run --example scheduled_attention` prints that same continuation, one step at a time. `decode` turns ids back into text and skips the end-of-sequence id.
+
+```python
+import paged_kv
+
+assert paged_kv.encode("hi") == [104, 105]
+ids, text = paged_kv.generate("hi", 2)
+assert ids == [104, 105, 34, 7]
+assert text == paged_kv.decode(ids)
+```
+
+The block is not trained, so those two ids are just its argmax. Failures raise `ValueError`.
+
+The same package can also fill slots and score them:
 
 ```python
 import paged_kv
@@ -50,7 +68,7 @@ pool.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])
 table.release(pool)
 ```
 
-`pip install` builds the extension. Failures raise `ValueError`. The same calls are covered by `a_python_caller_reserves_shares_and_preempts`.
+`pip install` builds the extension. These calls are covered by `a_python_caller_reserves_shares_and_preempts`.
 
 ## Write your own vector
 
@@ -306,7 +324,8 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | A scheduled generation writes the block's K and V and appends the id that block chose | `a_generation_loop_writes_nonzero_kv` |
 | The fixed block's weights stay put, and its scores read the stored rows | `weights_do_not_drift`, `forward_reads_the_stored_rows` |
 | `encode` then `decode` returns the same string | `encode_then_decode_round_trips` |
-| Python install path, including `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
+| `generate` appends the ids the fixed block chose | `generate_appends_ids_from_the_block` |
+| Python `encode`, `decode`, `generate`, and `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |
 | Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |
