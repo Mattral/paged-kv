@@ -1,36 +1,29 @@
-//! Admit a hard-coded prompt and decode two tokens.
+//! Encode a short string and decode the tokens the scheduler writes.
 //!
 //! The pool stores one vector per slot. Admission writes the prompt. Each
-//! step writes one new token id, one past the last id, and attention reads
-//! the stored K and V. That id rule is not a sampler. There is no tokenizer
-//! and no model.
+//! step still appends one past the last token id. There is no model.
 //!
 //! Run with `cargo run --example scheduled_attention --quiet`.
 
-use paged_kv::{BlockPool, Scheduler};
+use paged_kv::{decode, encode, BlockPool, Scheduler};
 
 fn main() -> Result<(), paged_kv::AllocError> {
     let head_dim = 2u32;
-    let prompt = [1u32, 2, 3, 4];
+    let text = "hi";
+    let prompt = encode(text);
     let mut sched = Scheduler::new(BlockPool::with_storage(8, 4, head_dim * 2), 1);
     let id = sched.add_tokens(&prompt, 2);
 
     sched.admit()?;
-    println!(
-        "prefill {:?} scores {:?}",
-        sched.token_ids(id).expect("prompt was written"),
-        sched.scores(id).expect("prefill ran attention")
-    );
+    let ids = sched.token_ids(id).expect("prompt was written");
+    println!("prompt {text:?} -> {ids:?} ({:?})", decode(ids));
 
     let mut steps = 0u32;
     loop {
         let step = sched.step()?;
         steps += 1;
-        println!(
-            "tokens {:?} scores {:?}",
-            sched.token_ids(id).expect("decode wrote a token"),
-            sched.scores(id).expect("decode ran attention")
-        );
+        let ids = sched.token_ids(id).expect("decode wrote a token");
+        println!("tokens {ids:?} text {:?}", decode(ids));
         if step.finished.contains(&id) {
             break;
         }

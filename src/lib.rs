@@ -8,20 +8,23 @@
 //! sequence when the caller asks. [`BlockPool::new`] tracks ids only.
 //! [`BlockPool::with_storage`] also keeps one `f32` vector per token slot,
 //! addressed by [`BlockId`]. On that pool, admission and each decode step
-//! write K and V and run attention. [`ContiguousTable`] is the non-paged
-//! baseline: one length and one capacity, with no blocks.
+//! write K and V and run attention. [`encode`] and [`decode`] map text to
+//! bytes and back. [`ContiguousTable`] is the non-paged baseline: one length
+//! and one capacity, with no blocks.
 
 mod attention;
 mod contiguous;
 mod prefix_cache;
 mod scheduler;
 mod sequence;
+mod tokenizer;
 
 pub use attention::{attend, fill_tokens, write_token, Attention};
 pub use contiguous::ContiguousTable;
 pub use prefix_cache::PrefixCache;
 pub use scheduler::{DecodeStep, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
+pub use tokenizer::{decode, encode, EOS, VOCAB_SIZE};
 
 /// Block id and slot of one token inside a [`BlockTable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
