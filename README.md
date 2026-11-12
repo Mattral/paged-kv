@@ -6,7 +6,7 @@ This library keeps fixed-size blocks. A pool created with storage holds one `f32
 cargo run --example fake_attention
 ```
 
-That prints five token ids, the block and slot each one landed in, a score per token, and a zero vector after the table is released. The scores are dot products of keys this crate derived from the token id. There is no tokenizer and no loaded model. The batcher does not call this step.
+That prints five token ids, the block and slot each one landed in, a score per token, and a zero vector after the table is released. The scores are dot products of keys this crate derived from the token id. There is no tokenizer and no loaded model. A scheduler whose pool stores vectors runs this same step on admission and on every token it appends. A metadata pool does not.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -71,7 +71,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Batch a few sequences
 
-The scheduler queues requests and reserves blocks. It does not write KV vectors, and it does not call `attend`. Paging still matters here when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts below are that comparison, on an Intel i9-9900 with rustc 1.99.1.
+The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. A metadata pool does not, and that is what the charts measure. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts are that comparison, on an Intel i9-9900 with rustc 1.99.1.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
@@ -300,6 +300,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Stored vectors, zeroed on free, copied by `cow` | `stored_kv_is_writable_until_the_block_is_freed`, `cow_copies_stored_kv_and_leaves_the_other_owner_unchanged` |
 | A token index maps to a block and slot | `token_loc_maps_a_logical_index_onto_a_block_slot` |
 | `fill_tokens` then `attend`, and release zeroes the block | `fill_then_attend_reads_the_stored_keys_and_free_zeroes_them` |
+| A scheduled generation writes non-zero KV and then releases it | `a_generation_loop_writes_nonzero_kv` |
 | Python install path, including `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |

@@ -13,11 +13,30 @@
 //! reserved in full at admission. There is no chunked prefill. Preemption is
 //! a caller hook: [`Scheduler::preempt`] removes the newest decoding
 //! sequence. Admission never preempts on its own.
+//!
+//! A pool from [`BlockPool::new`] only tracks block ids. A pool from
+//! [`BlockPool::with_storage`] makes admission write the prompt with
+//! [`fill_tokens`](crate::fill_tokens) and makes each decode step write one
+//! new token, then both run [`attend`](crate::attend). The new token id is
+//! one past the last id written. Callers that did not pass token ids get
+//! `1, 2, 3, ...`. That rule is not a sampler.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::sequence::{Phase, Sequence, SequenceId};
-use crate::{AllocError, BlockPool};
+use crate::{attend, write_token, AllocError, BlockPool};
+
+/// Token ids and the last attention scores for sequences on a storage pool.
+#[derive(Debug)]
+struct KvTrack {
+    head_dim: u32,
+    /// Prompt ids from [`Scheduler::add_tokens`]. Absent means `1..=prompt_len`.
+    prompts: HashMap<SequenceId, Vec<u32>>,
+    /// Ids written into slots, prompt first, then generated tokens.
+    written: HashMap<SequenceId, Vec<u32>>,
+    /// Last [`attend`](crate::attend) output for a sequence that holds blocks.
+    scores: HashMap<SequenceId, Vec<f32>>,
+}
 
 /// What happens to a sequence taken out of the batch by [`Scheduler::preempt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +97,8 @@ pub struct Scheduler {
     next_id: u64,
     waiting: VecDeque<Sequence>,
     running: Vec<Sequence>,
+    /// Present only when the pool stores vectors of an even width.
+    kv: Option<KvTrack>,
 }
 
 impl Scheduler {
@@ -87,13 +108,51 @@ impl Scheduler {
     /// Panics if `max_batch` is zero.
     pub fn new(pool: BlockPool, max_batch: usize) -> Self {
         assert!(max_batch > 0, "max_batch must be non-zero");
+        let kv = pool.floats_per_token().and_then(|width| {
+            let head_dim = width / 2;
+            if head_dim == 0 || head_dim.saturating_mul(2) != width {
+                None
+            } else {
+                Some(KvTrack {
+                    head_dim,
+                    prompts: HashMap::new(),
+                    written: HashMap::new(),
+                    scores: HashMap::new(),
+                })
+            }
+        });
         Self {
             pool,
             max_batch,
             next_id: 0,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            kv,
         }
+    }
+
+    /// `Some(head_dim)` when this step must write KV.
+    ///
+    /// A metadata pool is `Ok(None)`. Storage whose width is not two equal
+    /// halves is [`AllocError::KvWidth`].
+    fn storage_head(&self) -> Result<Option<u32>, AllocError> {
+        let Some(width) = self.pool.floats_per_token() else {
+            return Ok(None);
+        };
+        match &self.kv {
+            Some(kv) => Ok(Some(kv.head_dim)),
+            None => Err(AllocError::KvWidth {
+                floats_per_token: width,
+                head_dim: width / 2,
+            }),
+        }
+    }
+
+    fn prompt_ids(&self, id: SequenceId, prompt_len: u32) -> Vec<u32> {
+        if let Some(ids) = self.kv.as_ref().and_then(|kv| kv.prompts.get(&id)) {
+            return ids.clone();
+        }
+        (1..=prompt_len).collect()
     }
 
     /// Queue a request. This does not reserve blocks.
@@ -111,6 +170,39 @@ impl Scheduler {
         id
     }
 
+    /// Queue a prompt made of these token ids. This does not reserve blocks.
+    ///
+    /// The prompt length is `token_ids.len()`. On a storage pool, admission
+    /// writes these ids. On a metadata pool they only supply that length.
+    ///
+    /// # Panics
+    /// Panics if `token_ids.len()` does not fit in `u32`.
+    pub fn add_tokens(&mut self, token_ids: &[u32], max_new_tokens: u32) -> SequenceId {
+        let prompt_len = u32::try_from(token_ids.len()).expect("prompt length fits in u32");
+        let id = self.add(prompt_len, max_new_tokens);
+        if let Some(kv) = self.kv.as_mut() {
+            kv.prompts.insert(id, token_ids.to_vec());
+        }
+        id
+    }
+
+    /// Token ids written for `id`, prompt first.
+    ///
+    /// `None` when this pool stores no vectors, or the sequence has not been
+    /// admitted since it was last recomputed.
+    pub fn token_ids(&self, id: SequenceId) -> Option<&[u32]> {
+        self.kv.as_ref()?.written.get(&id).map(Vec::as_slice)
+    }
+
+    /// Last attention scores for `id`.
+    ///
+    /// One score per token currently in the sequence. `None` on the same
+    /// conditions as [`Scheduler::token_ids`]. An empty prompt has no scores
+    /// until the first generated token is written.
+    pub fn scores(&self, id: SequenceId) -> Option<&[f32]> {
+        self.kv.as_ref()?.scores.get(&id).map(Vec::as_slice)
+    }
+
     /// Move waiting sequences into the batch, oldest first.
     ///
     /// Stops when the batch is full, the queue is empty, or the oldest
@@ -119,8 +211,11 @@ impl Scheduler {
     /// queue.
     ///
     /// A paused sequence already holds its blocks. Admission resumes it
-    /// without asking the pool for more.
+    /// without asking the pool for more. On a storage pool, a fresh admission
+    /// writes the prompt and runs attention. A resumed sequence is not
+    /// rewritten.
     pub fn admit(&mut self) -> Result<Vec<SequenceId>, AllocError> {
+        let head_dim = self.storage_head()?;
         let mut admitted = Vec::new();
         let block_size = self.pool.block_size();
         while self.running.len() < self.max_batch {
@@ -136,6 +231,27 @@ impl Scheduler {
             let mut seq = self.waiting.pop_front().expect("front was observed");
             if seq.phase() == Phase::Paused {
                 seq.resume();
+            } else if let Some(head_dim) = head_dim {
+                let tokens = self.prompt_ids(seq.id(), seq.prompt_len());
+                if let Err(err) = seq.fill_prompt(&mut self.pool, head_dim, &tokens) {
+                    self.waiting.push_front(seq);
+                    return Err(err);
+                }
+                let scores = match tokens.last().copied() {
+                    None => Vec::new(),
+                    Some(query) => match attend(&self.pool, seq.table(), head_dim, query) {
+                        Ok(scores) => scores,
+                        Err(err) => {
+                            let _ = seq.discard_progress(&mut self.pool);
+                            self.waiting.push_front(seq);
+                            return Err(err);
+                        }
+                    },
+                };
+                let id = seq.id();
+                let kv = self.kv.as_mut().expect("storage head was checked");
+                kv.written.insert(id, tokens);
+                kv.scores.insert(id, scores);
             } else if let Err(err) = seq.allocate_prompt(&mut self.pool) {
                 self.waiting.push_front(seq);
                 return Err(err);
@@ -165,6 +281,10 @@ impl Scheduler {
                 self.waiting.push_back(seq);
                 return Err(PreemptError::Alloc(err));
             }
+            if let Some(kv) = self.kv.as_mut() {
+                kv.written.remove(&id);
+                kv.scores.remove(&id);
+            }
         } else {
             seq.pause();
         }
@@ -175,8 +295,11 @@ impl Scheduler {
     /// Append one generated token to every decoding sequence.
     ///
     /// If the pool cannot hold every new block the batch needs, no sequence
-    /// advances. Finished sequences are skipped and stay in the batch.
+    /// advances. Finished sequences are skipped and stay in the batch. On a
+    /// storage pool, each appended token is written and attention runs over
+    /// that sequence.
     pub fn step(&mut self) -> Result<DecodeStep, AllocError> {
+        let head_dim = self.storage_head()?;
         let block_size = self.pool.block_size();
         let mut extra = 0u64;
         for seq in &self.running {
@@ -197,6 +320,27 @@ impl Scheduler {
             }
             let id = seq.id();
             let done = seq.push_token(&mut self.pool)?;
+            if let Some(head_dim) = head_dim {
+                let next_id = self
+                    .kv
+                    .as_ref()
+                    .expect("storage head was checked")
+                    .written
+                    .get(&id)
+                    .and_then(|ids| ids.last())
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let loc = seq.token_loc(block_size, seq.len() - 1)?;
+                write_token(&mut self.pool, loc, head_dim, next_id)?;
+                let scores = attend(&self.pool, seq.table(), head_dim, next_id)?;
+                let kv = self.kv.as_mut().expect("storage head was checked");
+                kv.written
+                    .get_mut(&id)
+                    .expect("admission recorded the prompt ids")
+                    .push(next_id);
+                kv.scores.insert(id, scores);
+            }
             decoded.push(id);
             if done {
                 finished.push(id);
@@ -219,7 +363,13 @@ impl Scheduler {
                 kept.push(seq);
                 continue;
             }
-            retired.push(seq.id());
+            let id = seq.id();
+            retired.push(id);
+            if let Some(kv) = self.kv.as_mut() {
+                kv.prompts.remove(&id);
+                kv.written.remove(&id);
+                kv.scores.remove(&id);
+            }
             if let Err(err) = seq.release(&mut self.pool) {
                 if error.is_none() {
                     error = Some(err);
@@ -479,5 +629,70 @@ mod tests {
         assert_eq!(sched.waiting_len(), 0);
         assert_eq!(sched.retire().unwrap(), vec![finished]);
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+    }
+
+    #[test]
+    fn a_generation_loop_writes_nonzero_kv() {
+        let head_dim = 2;
+        let mut sched = Scheduler::new(BlockPool::with_storage(8, 4, head_dim * 2), 1);
+        let id = sched.add_tokens(&[1, 2, 3], 2);
+
+        assert_eq!(sched.admit().unwrap(), vec![id]);
+        assert_eq!(sched.token_ids(id).unwrap(), &[1, 2, 3]);
+        assert_eq!(sched.scores(id).unwrap().len(), 3);
+
+        let step = sched.step().unwrap();
+        assert!(step.finished.is_empty());
+        assert_eq!(sched.token_ids(id).unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(sched.scores(id).unwrap().len(), 4);
+
+        let step = sched.step().unwrap();
+        assert_eq!(step.finished, vec![id]);
+        assert_eq!(sched.token_ids(id).unwrap(), &[1, 2, 3, 4, 5]);
+        assert_eq!(sched.scores(id).unwrap().len(), 5);
+
+        let block_size = sched.pool().block_size();
+        let expected = [
+            [2.0, 4.0, 1.0, 2.0],
+            [3.0, 6.0, 1.5, 3.0],
+            [4.0, 8.0, 2.0, 4.0],
+            [5.0, 10.0, 2.5, 5.0],
+            [6.0, 12.0, 3.0, 6.0],
+        ];
+        let seq = &sched.running()[0];
+        for (index, values) in expected.iter().enumerate() {
+            let loc = seq.token_loc(block_size, index as u32).unwrap();
+            let stored = sched.pool().kv(loc.block, loc.slot).unwrap();
+            assert_eq!(stored, values);
+            assert!(stored.iter().any(|value| *value != 0.0));
+        }
+
+        assert_eq!(sched.retire().unwrap(), vec![id]);
+        assert!(sched.is_idle());
+        assert!(sched.scores(id).is_none());
+        assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+    }
+
+    #[test]
+    fn a_storage_width_that_is_not_two_halves_admits_nothing() {
+        let mut sched = Scheduler::new(BlockPool::with_storage(2, 4, 3), 1);
+        let id = sched.add_tokens(&[1], 1);
+        assert_eq!(
+            sched.admit().unwrap_err(),
+            AllocError::KvWidth {
+                floats_per_token: 3,
+                head_dim: 1,
+            }
+        );
+        assert!(sched.running().is_empty());
+        assert_eq!(sched.next_waiting().unwrap().id(), id);
+        assert_eq!(sched.pool().free_count(), sched.pool().capacity());
+        assert_eq!(
+            sched.step().unwrap_err(),
+            AllocError::KvWidth {
+                floats_per_token: 3,
+                head_dim: 1,
+            }
+        );
     }
 }

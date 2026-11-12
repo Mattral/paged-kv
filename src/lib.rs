@@ -5,10 +5,11 @@
 //! stores those forks under a caller-supplied key and counts hits.
 //! [`Scheduler`] admits sequences first-come, first-served, retires them
 //! when their token budget is spent, and can preempt the newest decoding
-//! sequence when the caller asks. [`ContiguousTable`] is the non-paged
-//! baseline: one length and one capacity, with no blocks. [`BlockPool::new`]
-//! tracks ids only. [`BlockPool::with_storage`] also keeps one `f32` vector
-//! per token slot, addressed by [`BlockId`].
+//! sequence when the caller asks. [`BlockPool::new`] tracks ids only.
+//! [`BlockPool::with_storage`] also keeps one `f32` vector per token slot,
+//! addressed by [`BlockId`]. On that pool, admission and each decode step
+//! write K and V and run attention. [`ContiguousTable`] is the non-paged
+//! baseline: one length and one capacity, with no blocks.
 
 mod attention;
 mod contiguous;

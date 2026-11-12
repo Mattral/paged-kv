@@ -4,7 +4,7 @@
 //! the tokens generated after admission. The block table underneath is still
 //! a single run of blocks.
 
-use crate::{AllocError, BlockPool, BlockTable};
+use crate::{AllocError, BlockPool, BlockTable, TokenLoc};
 
 /// Identifier assigned in arrival order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,17 +124,70 @@ impl Sequence {
     /// Reserve blocks for the prompt.
     ///
     /// A request with `max_new_tokens == 0` finishes immediately. The table
-    /// is unchanged when allocation fails.
+    /// is unchanged when allocation fails. This does not write KV vectors.
     pub fn allocate_prompt(&mut self, pool: &mut BlockPool) -> Result<(), AllocError> {
         debug_assert_eq!(self.phase, Phase::Waiting);
         debug_assert_eq!(self.generated, 0);
         self.table.grow(pool, self.prompt_len)?;
+        self.enter_after_prompt();
+        Ok(())
+    }
+
+    /// Reserve the prompt with [`crate::fill_tokens`] and write each id.
+    ///
+    /// `token_ids.len()` is the prompt length. On failure the table is
+    /// released and the sequence stays waiting.
+    pub(crate) fn fill_prompt(
+        &mut self,
+        pool: &mut BlockPool,
+        head_dim: u32,
+        token_ids: &[u32],
+    ) -> Result<(), AllocError> {
+        debug_assert_eq!(self.phase, Phase::Waiting);
+        debug_assert_eq!(self.generated, 0);
+        debug_assert_eq!(token_ids.len() as u32, self.prompt_len);
+        if let Err(err) = crate::fill_tokens(pool, &mut self.table, head_dim, token_ids) {
+            let table = std::mem::take(&mut self.table);
+            let _ = table.release(pool);
+            return Err(err);
+        }
+        self.enter_after_prompt();
+        Ok(())
+    }
+
+    /// Where logical token `index` lives.
+    ///
+    /// `block_size` must be the block size of the pool this sequence grew on.
+    pub fn token_loc(&self, block_size: u32, index: u32) -> Result<TokenLoc, AllocError> {
+        if index >= self.table.len() {
+            return Err(AllocError::TokenOutOfRange {
+                index,
+                len: self.table.len(),
+            });
+        }
+        let block_index = (index / block_size) as usize;
+        let Some(block) = self.table.blocks().get(block_index).copied() else {
+            return Err(AllocError::TokenOutOfRange {
+                index,
+                len: self.table.len(),
+            });
+        };
+        Ok(TokenLoc {
+            block,
+            slot: index % block_size,
+        })
+    }
+
+    pub(crate) fn table(&self) -> &BlockTable {
+        &self.table
+    }
+
+    fn enter_after_prompt(&mut self) {
         self.phase = if self.max_new_tokens == 0 {
             Phase::Finished
         } else {
             Phase::Decoding
         };
-        Ok(())
     }
 
     /// Append one generated token.
