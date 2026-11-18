@@ -234,7 +234,7 @@ Without sharing, 117 sequences fit. With the prefix stored once, 1,354 fit. That
 
 The counts above are the benefit: how many sequences fit. The timings here are the cost of the bookkeeping, not that benefit.
 
-These benches call `BlockPool::new`, so they store no vectors and copy no KV bytes. The numbers are the cost of updating lengths, free lists, and block ids. Each chart is one release run on an Intel i9-9900, rustc 1.99.1: 3 warmup runs, then the median of 21.
+These benches call `BlockPool::new`, so they store no vectors and copy no KV bytes. The numbers are the cost of updating lengths, free lists, and block ids. Each chart is one release run on an x86-64 desktop CPU, rustc 1.99.1: 3 warmup runs, then the median of 21.
 
 ![One token at a time, paged blocks take much longer than a doubling length. The ranges do not overlap.](docs/paged-vs-contiguous.svg)
 
