@@ -15,6 +15,7 @@
 
 mod attention;
 mod contiguous;
+mod gpt2;
 mod prefix_cache;
 mod scheduler;
 mod sequence;
@@ -23,6 +24,9 @@ mod tokenizer;
 
 pub use attention::{attend, fill_tokens, write_token, Attention};
 pub use contiguous::ContiguousTable;
+pub use gpt2::{
+    model_decode, model_encode, Gpt2, HEAD_DIM, KV_FLOATS, MODEL_EOS, MODEL_ID, MODEL_VOCAB,
+};
 pub use prefix_cache::PrefixCache;
 pub use scheduler::{generate, DecodeStep, Generated, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
@@ -128,13 +132,15 @@ pub enum AllocError {
         /// Head width the attention step was given.
         head_dim: u32,
     },
-    /// A token id is outside the byte vocabulary.
+    /// A token id is outside the vocabulary in use.
     TokenOutOfVocab {
         /// The id that was presented.
         id: u32,
-        /// [`VOCAB_SIZE`](crate::VOCAB_SIZE).
+        /// Size of the vocabulary that rejected it.
         vocab: u32,
     },
+    /// GPT-2 weights or its tokenizer could not be loaded.
+    Model(String),
 }
 
 impl std::fmt::Display for AllocError {
@@ -187,6 +193,7 @@ impl std::fmt::Display for AllocError {
             AllocError::TokenOutOfVocab { id, vocab } => {
                 write!(f, "token {id} is outside a vocabulary of {vocab}")
             }
+            AllocError::Model(message) => write!(f, "{message}"),
         }
     }
 }

@@ -30,3 +30,17 @@ harness = false
 [[bench]]
 name = "prefix_sharing"
 harness = false
+
+[dependencies]
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
+tokenizers = "0.23.2"
+
+# The model matmuls are unusable at opt-level 0. This does not change the
+# metadata benches; those still call BlockPool::new and were not remeasured.
+[profile.dev.package.candle-core]
+opt-level = 3
+
+[profile.dev.package.candle-nn]
+opt-level = 3
