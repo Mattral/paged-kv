@@ -6,6 +6,9 @@ description = "Paged KV blocks with stored f32 vectors, one GPT-2 forward, and F
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/Mattral/paged-kv"
+keywords = ["kv-cache", "attention", "inference", "llm", "paging"]
+categories = ["algorithms", "caching", "data-structures", "memory-management"]
+rust-version = "1.87"
 
 [features]
 gpt2 = ["dep:candle-core", "dep:candle-nn", "dep:hf-hub", "dep:tokenizers"]
