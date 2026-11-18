@@ -7,10 +7,10 @@
 //! when their token budget is spent, and can preempt the newest decoding
 //! sequence when the caller asks. [`BlockPool::new`] tracks ids only.
 //! [`BlockPool::with_storage`] also keeps one `f32` vector per token slot,
-//! addressed by [`BlockId`]. On that pool, admission and each decode step
-//! write K and V from [`TinyModel`] and take the next token from that block.
-//! [`encode`] and [`decode`] map text to bytes and back. [`generate`] runs
-//! that block on a string and returns the ids it appended. [`ContiguousTable`]
+//! addressed by [`BlockId`]. When that width is [`KV_FLOATS`], admission and
+//! each decode step run [`MODEL_ID`] and write its K and V. [`encode`] and
+//! [`decode`] map text to bytes and back. [`generate`] tokenizes with GPT-2,
+//! runs that model, and returns the ids from its logits. [`ContiguousTable`]
 //! is the non-paged baseline: one length and one capacity, with no blocks.
 
 mod attention;
@@ -19,7 +19,6 @@ mod gpt2;
 mod prefix_cache;
 mod scheduler;
 mod sequence;
-mod tiny_model;
 mod tokenizer;
 
 pub use attention::{attend, fill_tokens, write_token, Attention};
@@ -30,7 +29,6 @@ pub use gpt2::{
 pub use prefix_cache::PrefixCache;
 pub use scheduler::{generate, DecodeStep, Generated, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};
-pub use tiny_model::{ModelForward, TinyModel};
 pub use tokenizer::{decode, encode, EOS, VOCAB_SIZE};
 
 /// Block id and slot of one token inside a [`BlockTable`].

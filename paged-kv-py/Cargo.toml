@@ -1,8 +1,8 @@
 [package]
 name = "paged-kv-py"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "Python bindings for the paged-kv block pool and fixed-weight block"
+description = "Python bindings for the paged-kv block pool and GPT-2 forward"
 publish = false
 
 [lib]

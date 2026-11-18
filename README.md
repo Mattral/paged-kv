@@ -6,7 +6,7 @@ This library keeps fixed-size blocks. A pool created with storage holds one `f32
 cargo run --example fake_attention
 ```
 
-That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. `generate` runs one fixed-weight block on that text and returns the ids it appended. The block is not trained, and it does not load anyone else's weights. A metadata pool does not run it.
+That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. `generate` loads one model, `openai-community/gpt2` (124M), runs its forward, and returns token ids from its logits. The first call downloads `model.safetensors` and `tokenizer.json` into the Hugging Face cache. Later calls reuse those files. A metadata pool does not run the model.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -36,21 +36,27 @@ From a clean virtualenv, in this repo:
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install ./paged-kv-py
-.venv/bin/python -c 'import paged_kv; print(paged_kv.encode("hi")); print(paged_kv.generate("hi", 2))'
+.venv/bin/python -c 'import paged_kv; print(paged_kv.generate("The capital of France is", 1))'
 ```
 
-That prints the byte ids of `"hi"`, then the same ids plus the two the block appended, and the decoded text. `cargo run --example scheduled_attention` prints that same continuation, one step at a time. `decode` turns ids back into text and skips the end-of-sequence id.
+The first `generate` downloads `openai-community/gpt2`. That call prints the prompt's token ids, then `262`, and the text ending in ` the`. Greedy GPT-2 small picks that token. `encode` and `decode` are still the byte vocabulary, separate from the model's tokenizer.
+
+The same continuation, one step at a time, with the prompt after `--`:
+
+```sh
+cargo run --example scheduled_attention -- "The capital of France is"
+```
 
 ```python
 import paged_kv
 
 assert paged_kv.encode("hi") == [104, 105]
-ids, text = paged_kv.generate("hi", 2)
-assert ids == [104, 105, 34, 7]
-assert text == paged_kv.decode(ids)
+ids, text = paged_kv.generate("The capital of France is", 1)
+assert ids[-1] == 262
+assert text.endswith(" the")
 ```
 
-The block is not trained, so those two ids are just its argmax. Failures raise `ValueError`.
+`generate` runs one sequence. A storage scheduler can hold a few sequences, and each one runs its own forward. There is no fused batch and no continuous batching of a model server. Failures raise `ValueError`.
 
 The same package can also fill slots and score them:
 
@@ -92,7 +98,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Batch a few sequences
 
-The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. `cargo run --example scheduled_attention` encodes the string `"hi"`, runs that block, and prints the tokens as text. The next id is the block's argmax, and the new slot stores the block's K and V. A metadata pool does not run the block. The cost charts measure bookkeeping time on that pool. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The cost charts below are that comparison. The packing chart is how many sequences fit in one budget.
+The scheduler queues requests and reserves blocks. A metadata pool only tracks block ids. A storage pool whose width is GPT-2's K and V (`18432` floats: 12 layers, K and V, 768 each) runs `openai-community/gpt2` on admit and on each step, and writes those vectors into the slots. Any other width is rejected before the download. The example above is that path, one sequence at a time. A small batch still runs one forward per sequence. The cost charts measure bookkeeping time on the metadata pool. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The cost charts below are that comparison. The packing chart is how many sequences fit in one budget.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
@@ -281,9 +287,9 @@ The scheduler median is 1.44× the one-sequence loop, and every scheduler run is
 
 ## What this is not
 
-- A trained model, or a loader for someone else's checkpoint. `encode` and `decode` are a byte vocabulary, not a BPE model. On a storage pool the scheduler writes K and V from one fixed block and takes the next id from that block. `fill_tokens` still writes a fixed embedding for a caller who does not use the scheduler. `attend` reads whatever is stored.
+- A choice of models. The only checkpoint is `openai-community/gpt2`. `encode` and `decode` are still a byte vocabulary. `generate` uses GPT-2's tokenizer. `fill_tokens` still writes a fixed embedding for a caller who does not use the scheduler. `attend` reads whatever is stored.
 - A GPU tensor, or fp16. Storage is one `f32` vector per token slot on the CPU.
-- A serving server, and not a client for one.
+- A serving server. There is no continuous batching of this model. `generate` and the example run one sequence. `Scheduler::step` can hold a few sequences, and each one runs its own forward.
 - A multi-device cache.
 - Automatic prefix sharing. The cache is there. `Scheduler::admit` does not call it.
 - Automatic preemption. `preempt` runs when you call it.
@@ -356,10 +362,9 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Stored vectors, zeroed on free, copied by `cow` | `stored_kv_is_writable_until_the_block_is_freed`, `cow_copies_stored_kv_and_leaves_the_other_owner_unchanged` |
 | A token index maps to a block and slot | `token_loc_maps_a_logical_index_onto_a_block_slot` |
 | `attend` reads stored K and V, and release zeroes the block | `fill_then_attend_reads_the_stored_keys_and_free_zeroes_them` |
-| A scheduled generation writes the block's K and V and appends the id that block chose | `a_generation_loop_writes_nonzero_kv` |
-| The fixed block's weights stay put, and its scores read the stored rows | `weights_do_not_drift`, `forward_reads_the_stored_rows` |
+| A scheduled generation writes GPT-2's K and V and appends the id from its logits | `a_generation_loop_writes_the_model_kv`, `gpt2_next_token_comes_from_the_logits` |
 | `encode` then `decode` returns the same string | `encode_then_decode_round_trips` |
-| `generate` appends the ids the fixed block chose | `generate_appends_ids_from_the_block` |
+| `generate` appends the id GPT-2's logits chose | `generate_appends_ids_from_the_model` |
 | Python `encode`, `decode`, `generate`, and `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | A fixed budget fits more skewed sequences when blocks are paged | `skewed_lengths_fit_more_sequences_in_a_paged_pool`, `cargo bench --bench packing` |
 | One shared prefix fits more sequences in that same budget | `a_shared_prefix_fits_more_sequences`, `cargo bench --bench prefix_sharing` |

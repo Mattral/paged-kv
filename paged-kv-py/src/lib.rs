@@ -346,10 +346,11 @@ fn decode(ids: Vec<u32>) -> String {
     ::paged_kv::decode(&ids)
 }
 
-/// Run the fixed block on `text`.
+/// Run GPT-2 on `text`.
 ///
-/// Returns `(ids, text)`. `ids` starts with the byte ids of `text`, then up
-/// to `max_new_tokens` ids the block chose. `text` is those ids decoded.
+/// Returns `(ids, text)`. `ids` starts with GPT-2's tokenization of `text`,
+/// then up to `max_new_tokens` ids from that model's logits. The first call
+/// downloads `openai-community/gpt2`. `encode` and `decode` stay byte ids.
 #[pyfunction]
 fn generate(text: &str, max_new_tokens: u32) -> PyResult<(Vec<u32>, String)> {
     let generated = ::paged_kv::generate(text, max_new_tokens).map_err(alloc_err)?;
@@ -455,12 +456,12 @@ assert stored.free_count() == stored.capacity()
 
 assert paged_kv.encode('hi') == [104, 105]
 assert paged_kv.decode([104, 256, 105]) == 'hi'
-ids, text = paged_kv.generate('hi', 2)
-assert ids == [104, 105, 34, 7]
-assert text == paged_kv.decode(ids)
-assert ids[2:] != [106, 107]
+ids, text = paged_kv.generate('The capital of France is', 1)
+assert ids[-1] == 262
+assert text.endswith(' the')
 ids, text = paged_kv.generate('hi', 0)
-assert ids == [104, 105] and text == 'hi'
+assert text == 'hi'
+assert ids != [104, 105]
 ",
                 None,
                 None,

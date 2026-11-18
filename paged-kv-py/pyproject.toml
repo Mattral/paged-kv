@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "paged-kv"
-version = "0.7.0"
-description = "Paged KV blocks with stored f32 vectors, a fixed-weight block, and FCFS batching"
+version = "0.8.0"
+description = "Paged KV blocks with stored f32 vectors, one GPT-2 forward, and FCFS batching"
 requires-python = ">=3.8"
 
 [tool.maturin]

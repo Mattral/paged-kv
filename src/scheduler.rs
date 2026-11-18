@@ -15,31 +15,31 @@
 //! sequence. Admission never preempts on its own.
 //!
 //! A pool from [`BlockPool::new`] only tracks block ids. A pool from
-//! [`BlockPool::with_storage`] writes K and V from [`TinyModel`](crate::TinyModel)
-//! and chooses the next token with that block. Callers that did not pass
-//! token ids get `1, 2, 3, ...` for the prompt. An id outside the byte
-//! vocabulary is rejected.
+//! [`BlockPool::with_storage`] whose width is [`KV_FLOATS`](crate::KV_FLOATS)
+//! runs [`openai-community/gpt2`](crate::MODEL_ID). Admission writes that
+//! model's K and V for the prompt. Each step appends the id from its logits
+//! and writes that token's K and V. Any other storage width is rejected
+//! before the weights are loaded. Callers that did not pass token ids get
+//! `1, 2, 3, ...` for the prompt. An id outside the GPT-2 vocabulary is
+//! rejected before the weights are loaded.
 
 use std::collections::{HashMap, VecDeque};
 
 use crate::sequence::{Phase, Sequence, SequenceId};
-use crate::tokenizer::{EOS, VOCAB_SIZE};
-use crate::{AllocError, BlockPool, TinyModel};
+use crate::{AllocError, BlockPool};
 
 /// Token ids and the last attention scores for sequences on a storage pool.
 #[derive(Debug)]
 struct KvTrack {
-    head_dim: u32,
-    model: TinyModel,
     /// Prompt ids from [`Scheduler::add_tokens`]. Absent means `1..=prompt_len`.
     prompts: HashMap<SequenceId, Vec<u32>>,
     /// Ids written into slots, prompt first, then generated tokens.
     written: HashMap<SequenceId, Vec<u32>>,
-    /// Next id chosen by the block, waiting for the following step.
+    /// Next id chosen by the model, waiting for the following step.
     pending: HashMap<SequenceId, u32>,
     /// Last softmax weights for a sequence that holds blocks.
     scores: HashMap<SequenceId, Vec<f32>>,
-    /// Last mixed V vector for that same step.
+    /// Last mixed attention output for that same step.
     context: HashMap<SequenceId, Vec<f32>>,
 }
 
@@ -85,12 +85,12 @@ impl std::error::Error for PreemptError {
     }
 }
 
-/// Token ids and text from one run of the fixed block.
+/// Token ids and text from one GPT-2 generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generated {
-    /// Prompt bytes, then the ids the block appended.
+    /// Prompt ids from GPT-2's tokenizer, then the ids the model appended.
     pub ids: Vec<u32>,
-    /// [`decode`](crate::decode) of [`Generated::ids`].
+    /// [`model_decode`](crate::model_decode) of [`Generated::ids`].
     pub text: String,
 }
 
@@ -122,22 +122,16 @@ impl Scheduler {
     /// Panics if `max_batch` is zero.
     pub fn new(pool: BlockPool, max_batch: usize) -> Self {
         assert!(max_batch > 0, "max_batch must be non-zero");
-        let kv = pool.floats_per_token().and_then(|width| {
-            let head_dim = width / 2;
-            if head_dim == 0 || head_dim.saturating_mul(2) != width {
-                None
-            } else {
-                Some(KvTrack {
-                    head_dim,
-                    model: TinyModel::new(head_dim),
-                    prompts: HashMap::new(),
-                    written: HashMap::new(),
-                    scores: HashMap::new(),
-                    context: HashMap::new(),
-                    pending: HashMap::new(),
-                })
-            }
-        });
+        let kv = match pool.floats_per_token() {
+            Some(width) if width == crate::KV_FLOATS => Some(KvTrack {
+                prompts: HashMap::new(),
+                written: HashMap::new(),
+                scores: HashMap::new(),
+                context: HashMap::new(),
+                pending: HashMap::new(),
+            }),
+            _ => None,
+        };
         Self {
             pool,
             max_batch,
@@ -148,21 +142,22 @@ impl Scheduler {
         }
     }
 
-    /// `Some(head_dim)` when this step must write KV.
+    /// `true` when this step must run GPT-2 and write its K and V.
     ///
-    /// A metadata pool is `Ok(None)`. Storage whose width is not two equal
-    /// halves is [`AllocError::KvWidth`].
-    fn storage_head(&self) -> Result<Option<u32>, AllocError> {
+    /// A metadata pool is `Ok(false)`. Storage whose width is not
+    /// [`KV_FLOATS`](crate::KV_FLOATS) is [`AllocError::KvWidth`], and the
+    /// weights are not loaded.
+    fn stores_model_kv(&self) -> Result<bool, AllocError> {
         let Some(width) = self.pool.floats_per_token() else {
-            return Ok(None);
+            return Ok(false);
         };
-        match &self.kv {
-            Some(kv) => Ok(Some(kv.head_dim)),
-            None => Err(AllocError::KvWidth {
-                floats_per_token: width,
-                head_dim: width / 2,
-            }),
+        if width == crate::KV_FLOATS {
+            return Ok(true);
         }
+        Err(AllocError::KvWidth {
+            floats_per_token: width,
+            head_dim: crate::HEAD_DIM,
+        })
     }
 
     fn prompt_ids(&self, id: SequenceId, prompt_len: u32) -> Vec<u32> {
@@ -235,11 +230,11 @@ impl Scheduler {
     /// queue.
     ///
     /// A paused sequence already holds its blocks. Admission resumes it
-    /// without asking the pool for more. On a storage pool, a fresh admission
-    /// writes the prompt's K and V from the fixed block and runs that block.
+    /// without asking the pool for more. On a GPT-2 storage pool, a fresh
+    /// admission writes the prompt's K and V from the model and runs it.
     /// A resumed sequence is not rewritten.
     pub fn admit(&mut self) -> Result<Vec<SequenceId>, AllocError> {
-        let head_dim = self.storage_head()?;
+        let stores = self.stores_model_kv()?;
         let mut admitted = Vec::new();
         let block_size = self.pool.block_size();
         while self.running.len() < self.max_batch {
@@ -255,49 +250,39 @@ impl Scheduler {
             let mut seq = self.waiting.pop_front().expect("front was observed");
             if seq.phase() == Phase::Paused {
                 seq.resume();
-            } else if head_dim.is_some() {
+            } else if stores {
                 let tokens = self.prompt_ids(seq.id(), seq.prompt_len());
-                if let Some(id) = tokens.iter().copied().find(|id| *id >= VOCAB_SIZE) {
+                if tokens.is_empty() && seq.max_new_tokens() > 0 {
+                    self.waiting.push_front(seq);
+                    return Err(AllocError::Model("the prompt is empty".to_string()));
+                }
+                if let Some(id) = tokens.iter().copied().find(|id| *id >= crate::MODEL_VOCAB) {
                     self.waiting.push_front(seq);
                     return Err(AllocError::TokenOutOfVocab {
                         id,
-                        vocab: VOCAB_SIZE,
+                        vocab: crate::MODEL_VOCAB,
                     });
                 }
                 if let Err(err) = seq.allocate_prompt(&mut self.pool) {
                     self.waiting.push_front(seq);
                     return Err(err);
                 }
-                if let Err(err) = write_model_kv(
-                    &mut self.pool,
-                    &self.kv.as_ref().expect("storage head was checked").model,
-                    &seq,
-                    0,
-                    &tokens,
-                ) {
-                    let _ = seq.discard_progress(&mut self.pool);
-                    self.waiting.push_front(seq);
-                    return Err(err);
+                if !tokens.is_empty() {
+                    let forward = match prefill(&mut self.pool, &seq, &tokens) {
+                        Ok(forward) => forward,
+                        Err(err) => {
+                            let _ = seq.discard_progress(&mut self.pool);
+                            self.waiting.push_front(seq);
+                            return Err(err);
+                        }
+                    };
+                    let id = seq.id();
+                    let kv = self.kv.as_mut().expect("storage width was checked");
+                    kv.pending.insert(id, forward.next_token);
+                    kv.written.insert(id, tokens);
+                    kv.scores.insert(id, forward.scores);
+                    kv.context.insert(id, forward.context);
                 }
-                let forward = match forward_tokens(
-                    &self.pool,
-                    &self.kv.as_ref().expect("storage head was checked").model,
-                    &seq,
-                    &tokens,
-                ) {
-                    Ok(forward) => forward,
-                    Err(err) => {
-                        let _ = seq.discard_progress(&mut self.pool);
-                        self.waiting.push_front(seq);
-                        return Err(err);
-                    }
-                };
-                let id = seq.id();
-                let kv = self.kv.as_mut().expect("storage head was checked");
-                kv.pending.insert(id, forward.next_token);
-                kv.written.insert(id, tokens);
-                kv.scores.insert(id, forward.scores);
-                kv.context.insert(id, forward.context);
             } else if let Err(err) = seq.allocate_prompt(&mut self.pool) {
                 self.waiting.push_front(seq);
                 return Err(err);
@@ -344,11 +329,11 @@ impl Scheduler {
     ///
     /// If the pool cannot hold every new block the batch needs, no sequence
     /// advances. Finished sequences are skipped and stay in the batch. On a
-    /// storage pool, the appended id is the one the fixed block chose, and
-    /// its K and V are that block's projection. [`EOS`](crate::EOS) finishes
-    /// the sequence early.
+    /// GPT-2 storage pool, the appended id is the one the model chose, and
+    /// its K and V come from that forward. [`MODEL_EOS`](crate::MODEL_EOS)
+    /// finishes the sequence early. Each sequence runs its own forward.
     pub fn step(&mut self) -> Result<DecodeStep, AllocError> {
-        let head_dim = self.storage_head()?;
+        let stores = self.stores_model_kv()?;
         let block_size = self.pool.block_size();
         let mut extra = 0u64;
         for seq in &self.running {
@@ -369,38 +354,25 @@ impl Scheduler {
             }
             let id = seq.id();
             let mut done = seq.push_token(&mut self.pool)?;
-            if head_dim.is_some() {
-                let next_id = self
-                    .kv
-                    .as_ref()
-                    .expect("storage head was checked")
-                    .pending
-                    .get(&id)
-                    .copied()
-                    .expect("admission ran the block");
-                write_model_kv(
-                    &mut self.pool,
-                    &self.kv.as_ref().expect("storage head was checked").model,
-                    seq,
-                    seq.len() - 1,
-                    &[next_id],
-                )?;
-                let mut tokens = self
-                    .kv
-                    .as_ref()
-                    .expect("storage head was checked")
-                    .written
-                    .get(&id)
-                    .expect("admission recorded the prompt ids")
-                    .clone();
-                tokens.push(next_id);
-                let forward = forward_tokens(
-                    &self.pool,
-                    &self.kv.as_ref().expect("storage head was checked").model,
-                    seq,
-                    &tokens,
-                )?;
-                let kv = self.kv.as_mut().expect("storage head was checked");
+            if stores {
+                let (next_id, past_len) = {
+                    let kv = self.kv.as_ref().expect("storage width was checked");
+                    let next_id = kv
+                        .pending
+                        .get(&id)
+                        .copied()
+                        .expect("admission ran the model");
+                    let past_len = kv
+                        .written
+                        .get(&id)
+                        .expect("admission recorded the prompt ids")
+                        .len();
+                    (next_id, past_len)
+                };
+                let past = read_rows(&self.pool, seq, past_len)?;
+                let forward = crate::gpt2::model()?.forward_token(next_id, past_len, &past)?;
+                write_row(&mut self.pool, seq, past_len as u32, &forward.kv)?;
+                let kv = self.kv.as_mut().expect("storage width was checked");
                 kv.written
                     .get_mut(&id)
                     .expect("admission recorded the prompt ids")
@@ -408,7 +380,7 @@ impl Scheduler {
                 kv.pending.insert(id, forward.next_token);
                 kv.scores.insert(id, forward.scores);
                 kv.context.insert(id, forward.context);
-                if next_id == EOS {
+                if next_id == crate::MODEL_EOS {
                     seq.finish();
                     done = true;
                 }
@@ -488,55 +460,81 @@ impl Scheduler {
     }
 }
 
-fn write_model_kv(
-    pool: &mut BlockPool,
-    model: &TinyModel,
-    seq: &Sequence,
-    start: u32,
-    tokens: &[u32],
-) -> Result<(), AllocError> {
+fn read_rows(pool: &BlockPool, seq: &Sequence, count: usize) -> Result<Vec<Vec<f32>>, AllocError> {
     let block_size = pool.block_size();
-    for (offset, token) in tokens.iter().copied().enumerate() {
-        let loc = seq.token_loc(block_size, start + offset as u32)?;
-        let row = model.kv(token)?;
-        pool.kv_mut(loc.block, loc.slot)?.copy_from_slice(&row);
-    }
-    Ok(())
-}
-
-fn forward_tokens(
-    pool: &BlockPool,
-    model: &TinyModel,
-    seq: &Sequence,
-    tokens: &[u32],
-) -> Result<crate::ModelForward, AllocError> {
-    let block_size = pool.block_size();
-    let mut rows = Vec::with_capacity(tokens.len());
-    for index in 0..tokens.len() as u32 {
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count as u32 {
         let loc = seq.token_loc(block_size, index)?;
         rows.push(pool.kv(loc.block, loc.slot)?.to_vec());
     }
-    model.forward(tokens, &rows)
+    Ok(rows)
 }
 
-/// Encode `text`, run the fixed block, and decode the ids it produced.
+fn write_row(
+    pool: &mut BlockPool,
+    seq: &Sequence,
+    index: u32,
+    row: &[f32],
+) -> Result<(), AllocError> {
+    let loc = seq.token_loc(pool.block_size(), index)?;
+    pool.kv_mut(loc.block, loc.slot)?.copy_from_slice(row);
+    Ok(())
+}
+
+/// Run the prompt one token at a time and store each K/V row in the pool.
+fn prefill(
+    pool: &mut BlockPool,
+    seq: &Sequence,
+    tokens: &[u32],
+) -> Result<crate::gpt2::TokenStep, AllocError> {
+    let model = crate::gpt2::model()?;
+    let mut past = Vec::with_capacity(tokens.len());
+    let mut last = None;
+    for (position, token) in tokens.iter().copied().enumerate() {
+        let step = model.forward_token(token, position, &past)?;
+        write_row(pool, seq, position as u32, &step.kv)?;
+        past.push(step.kv.clone());
+        last = Some(step);
+    }
+    last.ok_or_else(|| AllocError::Model("the prompt is empty".to_string()))
+}
+
+/// Encode `text` with GPT-2, run that model, and decode the ids it produced.
 ///
-/// The block dimension is 2, the same width as `scheduled_attention`.
-/// At most `max_new_tokens` ids are appended. [`EOS`] stops the loop early.
-/// The pool is released before this returns.
+/// The first call downloads `openai-community/gpt2`. At most `max_new_tokens`
+/// ids are appended. The end-of-text id stops the loop early. One sequence
+/// is running. The pool is released before this returns.
 ///
 /// # Panics
 /// Panics if the prompt length or the full length does not fit in `u32`.
 pub fn generate(text: &str, max_new_tokens: u32) -> Result<Generated, AllocError> {
-    const HEAD_DIM: u32 = 2;
     const BLOCK_SIZE: u32 = 16;
-    let prompt = crate::encode(text);
+    let prompt = crate::model_encode(text)?;
+    if prompt.is_empty() {
+        if max_new_tokens == 0 {
+            return Ok(Generated {
+                ids: Vec::new(),
+                text: crate::model_decode(&[])?,
+            });
+        }
+        return Err(AllocError::Model("the prompt is empty".to_string()));
+    }
     let prompt_len = u32::try_from(prompt.len()).expect("prompt length fits in u32");
     let total = prompt_len
         .checked_add(max_new_tokens)
         .expect("generation length fits in u32");
+    if total as usize > crate::gpt2::N_POSITIONS {
+        return Err(AllocError::Model(format!(
+            "generation length {total} is past {}'s context of {}",
+            crate::MODEL_ID,
+            crate::gpt2::N_POSITIONS
+        )));
+    }
     let blocks = BlockPool::blocks_needed(total, BLOCK_SIZE).max(1);
-    let mut sched = Scheduler::new(BlockPool::with_storage(blocks, BLOCK_SIZE, HEAD_DIM * 2), 1);
+    let mut sched = Scheduler::new(
+        BlockPool::with_storage(blocks, BLOCK_SIZE, crate::KV_FLOATS),
+        1,
+    );
     let id = sched.add_tokens(&prompt, max_new_tokens);
     sched.admit()?;
     for _ in 0..max_new_tokens {
@@ -553,7 +551,7 @@ pub fn generate(text: &str, max_new_tokens: u32) -> Result<Generated, AllocError
         .token_ids(id)
         .expect("admission wrote the prompt")
         .to_vec();
-    let decoded = crate::decode(&ids);
+    let decoded = crate::model_decode(&ids)?;
     sched.retire()?;
     Ok(Generated { ids, text: decoded })
 }
@@ -776,40 +774,31 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_loop_writes_nonzero_kv() {
-        let head_dim = 2;
-        let model = TinyModel::new(head_dim);
-        let mut sched = Scheduler::new(BlockPool::with_storage(8, 4, head_dim * 2), 1);
-        let prompt = [1u32, 2, 3];
-        let id = sched.add_tokens(&prompt, 2);
+    fn a_generation_loop_writes_the_model_kv() {
+        let model = crate::gpt2::model().unwrap();
+        let prompt = model.encode("The").unwrap();
+        assert_eq!(prompt, vec![464]);
+        let mut sched = Scheduler::new(BlockPool::with_storage(2, 16, crate::KV_FLOATS), 1);
+        let id = sched.add_tokens(&prompt, 1);
 
         assert_eq!(sched.admit().unwrap(), vec![id]);
-        assert_eq!(sched.token_ids(id).unwrap(), &prompt);
-        assert_eq!(sched.scores(id).unwrap().len(), prompt.len());
-        assert_stored_matches_model(&sched, &model);
+        let first = model.forward_token(prompt[0], 0, &[]).unwrap();
+        assert_eq!(sched.token_ids(id).unwrap(), prompt.as_slice());
+        assert_eq!(sched.scores(id).unwrap(), first.scores.as_slice());
+        assert_stored_row(&sched, 0, &first.kv);
 
-        let mut expected = prompt.to_vec();
-        let chosen = model
-            .forward(&expected, &rows_for(&model, &expected))
-            .unwrap()
-            .next_token;
-        let step = sched.step().unwrap();
-        assert!(step.finished.is_empty());
-        expected.push(chosen);
-        assert_eq!(sched.token_ids(id).unwrap(), expected.as_slice());
-        assert_eq!(sched.scores(id).unwrap().len(), expected.len());
-        assert_stored_matches_model(&sched, &model);
-
-        let chosen = model
-            .forward(&expected, &rows_for(&model, &expected))
-            .unwrap()
-            .next_token;
         let step = sched.step().unwrap();
         assert_eq!(step.finished, vec![id]);
-        expected.push(chosen);
+        let mut expected = prompt.clone();
+        expected.push(first.next_token);
         assert_eq!(sched.token_ids(id).unwrap(), expected.as_slice());
-        assert_ne!(&expected[prompt.len()..], &[4, 5]);
-        assert_stored_matches_model(&sched, &model);
+        assert_ne!(first.next_token, prompt[0] + 1);
+        let second = model
+            .forward_token(first.next_token, 1, std::slice::from_ref(&first.kv))
+            .unwrap();
+        assert_eq!(sched.scores(id).unwrap(), second.scores.as_slice());
+        assert_stored_row(&sched, 0, &first.kv);
+        assert_stored_row(&sched, 1, &second.kv);
 
         assert_eq!(sched.retire().unwrap(), vec![id]);
         assert!(sched.is_idle());
@@ -817,35 +806,24 @@ mod tests {
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
     }
 
-    fn rows_for(model: &TinyModel, tokens: &[u32]) -> Vec<Vec<f32>> {
-        tokens
-            .iter()
-            .copied()
-            .map(|token| model.kv(token).unwrap())
-            .collect()
-    }
-
-    fn assert_stored_matches_model(sched: &Scheduler, model: &TinyModel) {
+    fn assert_stored_row(sched: &Scheduler, index: u32, row: &[f32]) {
         let block_size = sched.pool().block_size();
         let seq = &sched.running()[0];
-        let ids = sched.token_ids(seq.id()).unwrap();
-        for (index, token) in ids.iter().copied().enumerate() {
-            let loc = seq.token_loc(block_size, index as u32).unwrap();
-            let stored = sched.pool().kv(loc.block, loc.slot).unwrap();
-            assert_eq!(stored, model.kv(token).unwrap().as_slice());
-            assert!(stored.iter().any(|value| *value != 0.0));
-        }
+        let loc = seq.token_loc(block_size, index).unwrap();
+        let stored = sched.pool().kv(loc.block, loc.slot).unwrap();
+        assert_eq!(stored, row);
+        assert!(stored.iter().any(|value| *value != 0.0));
     }
 
     #[test]
-    fn a_storage_width_that_is_not_two_halves_admits_nothing() {
+    fn a_storage_width_that_is_not_the_model_width_admits_nothing() {
         let mut sched = Scheduler::new(BlockPool::with_storage(2, 4, 3), 1);
         let id = sched.add_tokens(&[1], 1);
         assert_eq!(
             sched.admit().unwrap_err(),
             AllocError::KvWidth {
                 floats_per_token: 3,
-                head_dim: 1,
+                head_dim: crate::HEAD_DIM,
             }
         );
         assert!(sched.running().is_empty());
@@ -855,20 +833,20 @@ mod tests {
             sched.step().unwrap_err(),
             AllocError::KvWidth {
                 floats_per_token: 3,
-                head_dim: 1,
+                head_dim: crate::HEAD_DIM,
             }
         );
     }
 
     #[test]
     fn a_token_outside_the_vocabulary_admits_nothing() {
-        let mut sched = Scheduler::new(BlockPool::with_storage(4, 4, 4), 1);
-        let id = sched.add_tokens(&[VOCAB_SIZE], 0);
+        let mut sched = Scheduler::new(BlockPool::with_storage(1, 4, crate::KV_FLOATS), 1);
+        let id = sched.add_tokens(&[crate::MODEL_VOCAB], 0);
         assert_eq!(
             sched.admit().unwrap_err(),
             AllocError::TokenOutOfVocab {
-                id: VOCAB_SIZE,
-                vocab: VOCAB_SIZE,
+                id: crate::MODEL_VOCAB,
+                vocab: crate::MODEL_VOCAB,
             }
         );
         assert!(sched.running().is_empty());
@@ -877,32 +855,18 @@ mod tests {
     }
 
     #[test]
-    fn generate_appends_ids_from_the_block() {
-        let text = "hi";
-        let out = generate(text, 2).unwrap();
-        let prompt = crate::encode(text);
+    fn generate_appends_ids_from_the_model() {
+        let text = "The capital of France is";
+        let out = generate(text, 1).unwrap();
+        let prompt = crate::model_encode(text).unwrap();
         assert_eq!(&out.ids[..prompt.len()], prompt.as_slice());
-        assert_eq!(out.text, crate::decode(&out.ids));
-        assert_eq!(out.ids, vec![104, 105, 34, 7]);
+        assert_eq!(*out.ids.last().unwrap(), 262);
+        assert_eq!(out.text, crate::model_decode(&out.ids).unwrap());
+        assert!(out.text.ends_with(" the"));
 
-        let model = TinyModel::new(2);
-        let mut expected = prompt;
-        for _ in 0..2 {
-            let rows: Vec<Vec<f32>> = expected
-                .iter()
-                .copied()
-                .map(|token| model.kv(token).unwrap())
-                .collect();
-            let next = model.forward(&expected, &rows).unwrap().next_token;
-            expected.push(next);
-            if next == EOS {
-                break;
-            }
-        }
-        assert_eq!(out.ids, expected);
-
-        let prompt_only = generate(text, 0).unwrap();
-        assert_eq!(prompt_only.ids, crate::encode(text));
-        assert_eq!(prompt_only.text, text);
+        let prompt_only = generate("hi", 0).unwrap();
+        assert_eq!(prompt_only.ids, crate::model_encode("hi").unwrap());
+        assert_eq!(prompt_only.text, "hi");
+        assert_ne!(prompt_only.ids, crate::encode("hi"));
     }
 }
