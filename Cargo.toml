@@ -4,6 +4,8 @@ version = "0.7.0"
 edition = "2021"
 description = "Paged KV blocks with stored f32 vectors, a fixed-weight block, and FCFS batching"
 readme = "README.md"
+license = "MIT"
+repository = "https://github.com/Mattral/paged-kv"
 
 [workspace]
 members = [".", "paged-kv-py"]
