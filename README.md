@@ -1,12 +1,26 @@
 # paged-kv
 
-This library keeps fixed-size blocks. A pool created with storage holds one `f32` vector in each token slot.
+Paged KV-cache blocks and an FCFS scheduler.
+
+A synthetic packing run fits 607 sequences in paged blocks, 529 when each buffer doubles and 64 when every sequence reserves the max length.
+
+```sh
+cargo add paged-kv
+```
+
+The GPT-2 example stays off unless you enable it. The first run downloads `openai-community/gpt2`.
+
+```sh
+cargo run --example scheduled_attention --features gpt2 -- "The capital of France is"
+```
+
+One sequence or a small batch. No model server. The packing benchmark is synthetic.
+
+`fake_attention` writes a fixed embedding and prints the scores.
 
 ```sh
 cargo run --example fake_attention
 ```
-
-That prints five token ids, the block and slot each one landed in, attention scores, and a zero vector after the table is released. The scores are softmax weights over the stored keys. The context is those weights applied to the stored values. The vector written for a token id is a fixed embedding. Attention reads whatever is in the slots, so changing a stored key changes the scores. `encode` and `decode` turn text into byte ids and back. `generate` loads one model, `openai-community/gpt2` (124M), runs its forward, and returns token ids from its logits. The first call downloads `model.safetensors` and `tokenizer.json` into the Hugging Face cache. Later calls reuse those files. A metadata pool does not run the model.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -36,16 +50,10 @@ From a clean virtualenv, in this repo:
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install ./paged-kv-py
-.venv/bin/python -c 'import paged_kv; print(paged_kv.generate("The capital of France is", 1))'
+.venv/bin/python -c 'import paged_kv; print(paged_kv.encode("hi"))'
 ```
 
-The first `generate` downloads `openai-community/gpt2`. That call prints the prompt's token ids, then `262`, and the text ending in ` the`. Greedy GPT-2 small picks that token. `encode` and `decode` are still the byte vocabulary, separate from the model's tokenizer.
-
-The same continuation, one step at a time, with the prompt after `--`:
-
-```sh
-cargo run --example scheduled_attention -- "The capital of France is"
-```
+`encode` and `decode` are the byte vocabulary. `generate` needs the `gpt2` feature. The command in the opening is that path.
 
 ```python
 import paged_kv
@@ -98,7 +106,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Batch a few sequences
 
-The scheduler queues requests and reserves blocks. A metadata pool only tracks block ids. A storage pool whose width is GPT-2's K and V (`18432` floats: 12 layers, K and V, 768 each) runs `openai-community/gpt2` on admit and on each step, and writes those vectors into the slots. Any other width is rejected before the download. The example above is that path, one sequence at a time. A small batch still runs one forward per sequence. The cost charts measure bookkeeping time on the metadata pool. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The cost charts below are that comparison. The packing chart is how many sequences fit in one budget.
+The scheduler queues requests and reserves blocks. A metadata pool only tracks block ids. A storage pool whose width is GPT-2's K and V (`18432` floats: 12 layers, K and V, 768 each) runs `openai-community/gpt2` on admit and on each step when the `gpt2` feature is on, and writes those vectors into the slots. Any other width is rejected before the download. The example above is that path, one sequence at a time. A small batch still runs one forward per sequence. The cost charts measure bookkeeping time on the metadata pool. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The cost charts below are that comparison. The packing chart is how many sequences fit in one budget.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
