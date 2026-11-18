@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="240" viewBox="0 0 760 240" role="img">
+  <title>Sharing one prefix fits 1237 more sequences in the same pool.</title>
+  <desc>Fixed budget of 65536 token slots, block size 16. Each sequence is a 512-token prefix plus a 48-token tail. Shared prefix fits 1354 sequences. Private prefixes fit 117.</desc>
+  <rect width="760" height="240" rx="12" fill="#ffffff" stroke="#e6e8ee"/>
+  <text x="32" y="36" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="600">One shared prefix fits 1,237 more sequences</text>
+  <text x="32" y="58" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Same 65,536 slots. Each sequence is 512 shared tokens plus a 48-token tail.</text>
+
+  <text x="32" y="96" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Prefix stored once</text>
+  <rect x="32" y="106" width="600" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="106" width="600" height="26" rx="4" fill="#e45756"/>
+  <text x="644" y="124" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">1,354</text>
+
+  <text x="32" y="166" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Prefix stored on every sequence</text>
+  <rect x="32" y="176" width="600" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="176" width="51.8" height="26" rx="4" fill="#4c78a8"/>
+  <text x="644" y="194" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">117</text>
+</svg>

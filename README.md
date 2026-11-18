@@ -193,6 +193,7 @@ The Python module has the same scheduler. `preempt("pause")` keeps blocks. `pree
 cargo test
 cargo test -p paged-kv-py
 cargo bench --bench packing
+cargo bench --bench prefix_sharing
 cargo bench --bench paged_vs_contiguous
 cargo bench --bench alloc_load
 cargo bench --bench scheduler_overhead
@@ -213,6 +214,21 @@ Paged blocks fit 543 more sequences than reserving 1,024 slots for every sequenc
 | Max-length reserve of 1,024 | 64 | 59,136 |
 
 These counts do not depend on a timer. `cargo bench --bench packing` prints them. `skewed_lengths_fit_more_sequences_in_a_paged_pool` locks them.
+
+## What sharing a prefix adds
+
+Same budget, 65,536 slots, blocks of 16. Each sequence is a 512-token prefix and a 48-token tail. The prefix ends on a block boundary, so a shared copy covers it exactly.
+
+![Storing the prefix once fits 1,354 sequences. Storing it on every sequence fits 117.](docs/prefix-sharing.svg)
+
+Without sharing, 117 sequences fit. With the prefix stored once, 1,354 fit. That is 1,237 more. Each private run spends 560 slots per sequence. Each shared run spends 512 slots once, then 48 slots per sequence. Neither run wastes slots inside a block. The gain is the prefix that is not copied.
+
+| | Sequences that fit |
+| --- | --- |
+| Prefix stored on every sequence | 117 |
+| Prefix stored once | 1,354 |
+
+`cargo bench --bench prefix_sharing` prints both counts. `a_shared_prefix_fits_more_sequences` locks them.
 
 ## What the bookkeeping costs
 
@@ -260,7 +276,7 @@ The scheduler median is 1.44× the one-sequence loop, and every scheduler run is
 
 - The benches use the metadata pool. Filling the `f32` vectors, and the attention step, are not in these timings.
 - Every sequence in the paged-versus-contiguous bench stays live at once. A pool that is filled, freed, and filled again over a long run is a different story. The allocate/free bench is the one that recycles, and it shows no clear saving.
-- Nothing in the benches shares a prefix. `PrefixCache` can avoid a second set of blocks. That saving is not in the timings.
+- The timing benches do not share a prefix. The extra sequences from storing one prefix once are counted above, not in these timings.
 - The scheduler adds its own cost on top of paging. Head-of-line blocking and all-or-nothing steps are part of that design.
 
 ## What this is not
@@ -346,6 +362,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | `generate` appends the ids the fixed block chose | `generate_appends_ids_from_the_block` |
 | Python `encode`, `decode`, `generate`, and `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
 | A fixed budget fits more skewed sequences when blocks are paged | `skewed_lengths_fit_more_sequences_in_a_paged_pool`, `cargo bench --bench packing` |
+| One shared prefix fits more sequences in that same budget | `a_shared_prefix_fits_more_sequences`, `cargo bench --bench prefix_sharing` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |
 | Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |

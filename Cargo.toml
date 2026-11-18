@@ -24,3 +24,7 @@ harness = false
 [[bench]]
 name = "packing"
 harness = false
+
+[[bench]]
+name = "prefix_sharing"
+harness = false
