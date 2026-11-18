@@ -92,7 +92,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 
 ## Batch a few sequences
 
-The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. `cargo run --example scheduled_attention` encodes the string `"hi"`, runs that block, and prints the tokens as text. The next id is the block's argmax, and the new slot stores the block's K and V. A metadata pool does not run the block, and that is what the charts measure. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The charts are that comparison, on an Intel i9-9900 with rustc 1.99.1.
+The scheduler queues requests and reserves blocks. If the pool stores vectors, admission writes the prompt and each step writes one new token, then attention runs over that sequence. `cargo run --example scheduled_attention` encodes the string `"hi"`, runs that block, and prints the tokens as text. The next id is the block's argmax, and the new slot stores the block's K and V. A metadata pool does not run the block. The cost charts measure bookkeeping time on that pool. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The cost charts below are that comparison. The packing chart is how many sequences fit in one budget.
 
 ```rust
 use paged_kv::{BlockPool, Scheduler};
@@ -192,12 +192,31 @@ The Python module has the same scheduler. `preempt("pause")` keeps blocks. `pree
 ```sh
 cargo test
 cargo test -p paged-kv-py
+cargo bench --bench packing
 cargo bench --bench paged_vs_contiguous
 cargo bench --bench alloc_load
 cargo bench --bench scheduler_overhead
 ```
 
-## What the timings say
+## How many sequences fit
+
+Paging is for a fixed pool and uneven lengths. The budget here is 65,536 token slots. Fifteen of every sixteen sequences are 40 tokens. Every sixteenth is 1,000. Each allocator admits sequences in that order and stops at the first one that does not fit. It does not skip a long sequence to take a shorter one behind it.
+
+![Paged blocks fit 607 sequences. Doubling fits 529. A max-length reserve fits 64.](docs/packing.svg)
+
+Paged blocks fit 543 more sequences than reserving 1,024 slots for every sequence, and 78 more than a buffer that doubles. Wasted slots are reserved room with no live token. Slots that were never reserved are not counted. A max-length reserve pays 1,024 slots even for a 40-token sequence. Doubling rounds each length up to a power of two, 64 or 1,024. Paging rounds up to 16, so those lengths reserve 48 and 1,008.
+
+| Allocator | Sequences that fit | Slots wasted |
+| --- | --- | --- |
+| Paged, blocks of 16 | 607 | 4,856 |
+| Contiguous, capacity doubles | 529 | 12,696 |
+| Max-length reserve of 1,024 | 64 | 59,136 |
+
+These counts do not depend on a timer. `cargo bench --bench packing` prints them. `skewed_lengths_fit_more_sequences_in_a_paged_pool` locks them.
+
+## What the bookkeeping costs
+
+The counts above are the benefit: how many sequences fit. The timings here are the cost of the bookkeeping, not that benefit.
 
 These benches call `BlockPool::new`, so they store no vectors and copy no KV bytes. The numbers are the cost of updating lengths, free lists, and block ids. Each chart is one release run on an Intel i9-9900, rustc 1.99.1: 3 warmup runs, then the median of 21.
 
@@ -326,6 +345,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | `encode` then `decode` returns the same string | `encode_then_decode_round_trips` |
 | `generate` appends the ids the fixed block chose | `generate_appends_ids_from_the_block` |
 | Python `encode`, `decode`, `generate`, and `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
+| A fixed budget fits more skewed sequences when blocks are paged | `skewed_lengths_fit_more_sequences_in_a_paged_pool`, `cargo bench --bench packing` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |
 | Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" role="img">
+  <title>Paged blocks fit more sequences than doubling or a max-length reserve.</title>
+  <desc>Fixed budget of 65536 token slots. Fifteen of every sixteen sequences are 40 tokens. Every sixteenth is 1000. Paged fits 607, doubling fits 529, and a max-length reserve of 1024 fits 64.</desc>
+  <rect width="760" height="300" rx="12" fill="#ffffff" stroke="#e6e8ee"/>
+  <text x="32" y="36" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="600">More sequences fit in the same 65,536 slots</text>
+  <text x="32" y="58" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Most sequences are 40 tokens. Every 16th is 1,000. Admission stops at the first one that does not fit.</text>
+
+  <text x="32" y="96" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Paged, blocks of 16</text>
+  <rect x="32" y="106" width="640" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="106" width="640" height="26" rx="4" fill="#e45756"/>
+  <text x="684" y="124" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">607</text>
+
+  <text x="32" y="166" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Contiguous, capacity doubles</text>
+  <rect x="32" y="176" width="640" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="176" width="557.7" height="26" rx="4" fill="#4c78a8"/>
+  <text x="684" y="194" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">529</text>
+
+  <text x="32" y="236" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Max-length reserve of 1,024</text>
+  <rect x="32" y="246" width="640" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="246" width="67.5" height="26" rx="4" fill="#f28e2b"/>
+  <text x="684" y="264" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">64</text>
+</svg>
