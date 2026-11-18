@@ -349,8 +349,9 @@ fn decode(ids: Vec<u32>) -> String {
 /// Run GPT-2 on `text`.
 ///
 /// Returns `(ids, text)`. `ids` starts with GPT-2's tokenization of `text`,
-/// then up to `max_new_tokens` ids from that model's logits. The first call
-/// downloads `openai-community/gpt2`. `encode` and `decode` stay byte ids.
+/// then up to `max_new_tokens` ids from that model's logits. Needs the `gpt2`
+/// feature. Without it this raises `ValueError` and does not download weights.
+/// `encode` and `decode` stay byte ids.
 #[pyfunction]
 fn generate(text: &str, max_new_tokens: u32) -> PyResult<(Vec<u32>, String)> {
     let generated = ::paged_kv::generate(text, max_new_tokens).map_err(alloc_err)?;
@@ -456,6 +457,32 @@ assert stored.free_count() == stored.capacity()
 
 assert paged_kv.encode('hi') == [104, 105]
 assert paged_kv.decode([104, 256, 105]) == 'hi'
+",
+                None,
+                None,
+            )
+            .inspect_err(|err| err.print(py))
+            .expect("python caller script");
+        });
+    }
+
+    #[cfg(feature = "gpt2")]
+    #[test]
+    #[ignore = "downloads openai-community/gpt2"]
+    fn a_python_caller_generates_with_the_model() {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "paged_kv").unwrap();
+            paged_kv(&module).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("paged_kv", &module)
+                .unwrap();
+
+            py.run(
+                c"
+import paged_kv
 ids, text = paged_kv.generate('The capital of France is', 1)
 assert ids[-1] == 262
 assert text.endswith(' the')
@@ -467,7 +494,7 @@ assert ids != [104, 105]
                 None,
             )
             .inspect_err(|err| err.print(py))
-            .expect("python caller script");
+            .expect("python generate script");
         });
     }
 }

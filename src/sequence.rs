@@ -185,6 +185,7 @@ impl Sequence {
         Ok(finished)
     }
 
+    #[cfg(feature = "gpt2")]
     pub(crate) fn finish(&mut self) {
         if self.phase == Phase::Decoding {
             self.phase = Phase::Finished;

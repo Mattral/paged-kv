@@ -7,11 +7,12 @@
 //! when their token budget is spent, and can preempt the newest decoding
 //! sequence when the caller asks. [`BlockPool::new`] tracks ids only.
 //! [`BlockPool::with_storage`] also keeps one `f32` vector per token slot,
-//! addressed by [`BlockId`]. When that width is [`KV_FLOATS`], admission and
-//! each decode step run [`MODEL_ID`] and write its K and V. [`encode`] and
-//! [`decode`] map text to bytes and back. [`generate`] tokenizes with GPT-2,
-//! runs that model, and returns the ids from its logits. [`ContiguousTable`]
-//! is the non-paged baseline: one length and one capacity, with no blocks.
+//! addressed by [`BlockId`]. When that width is [`KV_FLOATS`] and the `gpt2`
+//! feature is on, admission and each decode step run [`MODEL_ID`] and write
+//! its K and V. Without the feature those calls return [`AllocError::Model`]
+//! and download nothing. [`encode`] and [`decode`] map text to bytes and back.
+//! [`generate`] uses the same feature. [`ContiguousTable`] is the non-paged
+//! baseline: one length and one capacity, with no blocks.
 
 mod attention;
 mod contiguous;
@@ -23,9 +24,9 @@ mod tokenizer;
 
 pub use attention::{attend, fill_tokens, write_token, Attention};
 pub use contiguous::ContiguousTable;
-pub use gpt2::{
-    model_decode, model_encode, Gpt2, HEAD_DIM, KV_FLOATS, MODEL_EOS, MODEL_ID, MODEL_VOCAB,
-};
+#[cfg(feature = "gpt2")]
+pub use gpt2::{model_decode, model_encode, Gpt2};
+pub use gpt2::{HEAD_DIM, KV_FLOATS, MODEL_EOS, MODEL_ID, MODEL_VOCAB};
 pub use prefix_cache::PrefixCache;
 pub use scheduler::{generate, DecodeStep, Generated, PreemptError, PreemptPolicy, Scheduler};
 pub use sequence::{Phase, Sequence, SequenceId};

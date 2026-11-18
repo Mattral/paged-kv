@@ -1,23 +1,30 @@
 //! One loaded model: `openai-community/gpt2`.
 //!
-//! The first call downloads `model.safetensors` and `tokenizer.json` into the
-//! Hugging Face cache. Later calls reuse those files. The forward writes one
-//! K and one V vector per layer into a flat row the block pool can store, and
-//! the next id is the argmax of this model's logits.
+//! The loader is the `gpt2` feature. The first call downloads
+//! `model.safetensors` and `tokenizer.json` into the Hugging Face cache.
+//! Later calls reuse those files. Without the feature nothing is downloaded.
+//! The forward writes one K and one V vector per layer into a flat row the
+//! block pool can store, and the next id is the argmax of this model's logits.
 //!
 //! This is greedy and single-token. There is no batch of hidden states and
 //! no server.
 
+#[cfg(feature = "gpt2")]
 use std::collections::HashMap;
+#[cfg(feature = "gpt2")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "gpt2")]
 use candle_core::{Device, Tensor};
+#[cfg(feature = "gpt2")]
 use candle_nn::ops::layer_norm;
+#[cfg(feature = "gpt2")]
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "gpt2")]
 use crate::AllocError;
 
-/// Hub repo that [`load`] fetches.
+/// Hub repo the `gpt2` feature downloads.
 pub const MODEL_ID: &str = "openai-community/gpt2";
 /// GPT-2 small.
 pub const N_LAYER: usize = 12;
@@ -30,6 +37,7 @@ pub const HEAD_DIM_USIZE: usize = N_EMBD / N_HEAD;
 /// [`HEAD_DIM_USIZE`] as `u32`.
 pub const HEAD_DIM: u32 = HEAD_DIM_USIZE as u32;
 /// Context the position table covers.
+#[cfg_attr(not(feature = "gpt2"), allow(dead_code))]
 pub const N_POSITIONS: usize = 1024;
 /// Byte-pair vocabulary, including the end-of-text id.
 pub const MODEL_VOCAB: u32 = 50_257;
@@ -38,10 +46,13 @@ pub const MODEL_EOS: u32 = 50_256;
 /// Floats stored per token: every layer's K and V, each [`N_EMBD`] wide.
 pub const KV_FLOATS: u32 = (N_LAYER * 2 * N_EMBD) as u32;
 
+#[cfg(feature = "gpt2")]
 const LN_EPS: f32 = 1e-5;
+#[cfg(feature = "gpt2")]
 const N_INNER: usize = N_EMBD * 4;
 
 /// Result of running one token through every layer.
+#[cfg(feature = "gpt2")]
 #[derive(Debug, Clone)]
 pub struct TokenStep {
     /// K and V for this token, layer 0 first. Length is [`KV_FLOATS`].
@@ -54,6 +65,7 @@ pub struct TokenStep {
     pub context: Vec<f32>,
 }
 
+#[cfg(feature = "gpt2")]
 struct Layer {
     ln1_w: Tensor,
     ln1_b: Tensor,
@@ -70,6 +82,7 @@ struct Layer {
 }
 
 /// Weights and tokenizer for [`MODEL_ID`].
+#[cfg(feature = "gpt2")]
 pub struct Gpt2 {
     wte: Tensor,
     wpe: Tensor,
@@ -79,6 +92,7 @@ pub struct Gpt2 {
     tokenizer: Tokenizer,
 }
 
+#[cfg(feature = "gpt2")]
 impl Gpt2 {
     /// Download the weights if needed, then map them.
     pub fn load() -> Result<Self, AllocError> {
@@ -274,11 +288,13 @@ impl Gpt2 {
     }
 }
 
+#[cfg(feature = "gpt2")]
 struct Attended {
     context: Vec<f32>,
     scores: Vec<f32>,
 }
 
+#[cfg(feature = "gpt2")]
 fn attend(q: &[f32], keys: &[&[f32]], values: &[&[f32]]) -> Attended {
     let steps = keys.len();
     let scale = 1.0 / (HEAD_DIM_USIZE as f32).sqrt();
@@ -329,6 +345,7 @@ fn attend(q: &[f32], keys: &[&[f32]], values: &[&[f32]]) -> Attended {
     }
 }
 
+#[cfg(feature = "gpt2")]
 fn argmax(logits: &[f32]) -> u32 {
     let mut best_at = 0u32;
     let mut best = f32::NEG_INFINITY;
@@ -341,6 +358,7 @@ fn argmax(logits: &[f32]) -> u32 {
     best_at
 }
 
+#[cfg(feature = "gpt2")]
 fn row(table: &Tensor, index: usize) -> Result<Tensor, AllocError> {
     table
         .narrow(0, index, 1)
@@ -348,6 +366,7 @@ fn row(table: &Tensor, index: usize) -> Result<Tensor, AllocError> {
         .map_err(model_err)
 }
 
+#[cfg(feature = "gpt2")]
 fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor, AllocError> {
     let y = x
         .unsqueeze(0)
@@ -358,6 +377,7 @@ fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor, AllocErr
     Ok(y)
 }
 
+#[cfg(feature = "gpt2")]
 fn linear_no_bias(x: &Tensor, weight: &Tensor) -> Result<Tensor, AllocError> {
     x.unsqueeze(0)
         .and_then(|x| x.matmul(weight))
@@ -365,10 +385,12 @@ fn linear_no_bias(x: &Tensor, weight: &Tensor) -> Result<Tensor, AllocError> {
         .map_err(model_err)
 }
 
+#[cfg(feature = "gpt2")]
 fn model_err(err: candle_core::Error) -> AllocError {
     AllocError::Model(err.to_string())
 }
 
+#[cfg(feature = "gpt2")]
 fn take(weights: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor, AllocError> {
     if let Some(weight) = weights.remove(name) {
         return Ok(weight);
@@ -379,6 +401,7 @@ fn take(weights: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor, All
         .ok_or_else(|| AllocError::Model(format!("missing weight {name} in {MODEL_ID}")))
 }
 
+#[cfg(feature = "gpt2")]
 fn expect_shape(weight: &Tensor, shape: &[usize], name: &str) -> Result<(), AllocError> {
     if weight.dims() == shape {
         Ok(())
@@ -390,6 +413,7 @@ fn expect_shape(weight: &Tensor, shape: &[usize], name: &str) -> Result<(), Allo
     }
 }
 
+#[cfg(feature = "gpt2")]
 fn expect_in_out(
     weight: Tensor,
     input: usize,
@@ -412,6 +436,7 @@ fn expect_in_out(
 }
 
 /// The process-wide GPT-2 weights. The first call downloads them.
+#[cfg(feature = "gpt2")]
 pub fn model() -> Result<&'static Gpt2, AllocError> {
     static MODEL: OnceLock<Gpt2> = OnceLock::new();
     if let Some(loaded) = MODEL.get() {
@@ -425,20 +450,23 @@ pub fn model() -> Result<&'static Gpt2, AllocError> {
 }
 
 /// Encode `text` with GPT-2's tokenizer.
+#[cfg(feature = "gpt2")]
 pub fn model_encode(text: &str) -> Result<Vec<u32>, AllocError> {
     model()?.encode(text)
 }
 
 /// Decode GPT-2 token ids. The end-of-text id is skipped.
+#[cfg(feature = "gpt2")]
 pub fn model_decode(ids: &[u32]) -> Result<String, AllocError> {
     model()?.decode(ids)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpt2"))]
 mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "downloads openai-community/gpt2"]
     fn gpt2_next_token_comes_from_the_logits() {
         let model = Gpt2::load().expect("gpt2 weights");
         let ids = model.encode("The capital of France is").expect("encode");

@@ -6,7 +6,7 @@
 //! One sequence runs. This is not a model server.
 //!
 //! ```sh
-//! cargo run --example scheduled_attention -- "The capital of France is"
+//! cargo run --example scheduled_attention --features gpt2 -- "The capital of France is"
 //! ```
 
 use paged_kv::{model_decode, model_encode, BlockPool, Scheduler, KV_FLOATS};

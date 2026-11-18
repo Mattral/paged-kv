@@ -7,6 +7,9 @@ readme = "README.md"
 license = "MIT"
 repository = "https://github.com/Mattral/paged-kv"
 
+[features]
+gpt2 = ["dep:candle-core", "dep:candle-nn", "dep:hf-hub", "dep:tokenizers"]
+
 [workspace]
 members = [".", "paged-kv-py"]
 resolver = "2"
@@ -31,11 +34,15 @@ harness = false
 name = "prefix_sharing"
 harness = false
 
+[[example]]
+name = "scheduled_attention"
+required-features = ["gpt2"]
+
 [dependencies]
-candle-core = "0.11.1"
-candle-nn = "0.11.1"
-hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
-tokenizers = "0.23.2"
+candle-core = { version = "0.11.1", optional = true }
+candle-nn = { version = "0.11.1", optional = true }
+hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"], optional = true }
+tokenizers = { version = "0.23.2", optional = true }
 
 # The model matmuls are unusable at opt-level 0. This does not change the
 # metadata benches; those still call BlockPool::new and were not remeasured.

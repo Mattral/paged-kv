@@ -16,12 +16,13 @@
 //!
 //! A pool from [`BlockPool::new`] only tracks block ids. A pool from
 //! [`BlockPool::with_storage`] whose width is [`KV_FLOATS`](crate::KV_FLOATS)
-//! runs [`openai-community/gpt2`](crate::MODEL_ID). Admission writes that
-//! model's K and V for the prompt. Each step appends the id from its logits
-//! and writes that token's K and V. Any other storage width is rejected
-//! before the weights are loaded. Callers that did not pass token ids get
-//! `1, 2, 3, ...` for the prompt. An id outside the GPT-2 vocabulary is
-//! rejected before the weights are loaded.
+//! runs [`openai-community/gpt2`](crate::MODEL_ID) when the `gpt2` feature is
+//! on. Admission writes that model's K and V for the prompt. Each step appends
+//! the id from its logits and writes that token's K and V. Without the feature
+//! that path returns [`AllocError::Model`] and downloads nothing. Any other
+//! storage width is rejected before the weights are loaded. Callers that did
+//! not pass token ids get `1, 2, 3, ...` for the prompt. An id outside the
+//! GPT-2 vocabulary is rejected before the weights are loaded.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -90,7 +91,7 @@ impl std::error::Error for PreemptError {
 pub struct Generated {
     /// Prompt ids from GPT-2's tokenizer, then the ids the model appended.
     pub ids: Vec<u32>,
-    /// [`model_decode`](crate::model_decode) of [`Generated::ids`].
+    /// Text for [`Generated::ids`].
     pub text: String,
 }
 
@@ -263,10 +264,16 @@ impl Scheduler {
                         vocab: crate::MODEL_VOCAB,
                     });
                 }
+                #[cfg(not(feature = "gpt2"))]
+                if !tokens.is_empty() {
+                    self.waiting.push_front(seq);
+                    return Err(AllocError::Model("the gpt2 feature is off".to_string()));
+                }
                 if let Err(err) = seq.allocate_prompt(&mut self.pool) {
                     self.waiting.push_front(seq);
                     return Err(err);
                 }
+                #[cfg(feature = "gpt2")]
                 if !tokens.is_empty() {
                     let forward = match prefill(&mut self.pool, &seq, &tokens) {
                         Ok(forward) => forward,
@@ -353,7 +360,13 @@ impl Scheduler {
                 continue;
             }
             let id = seq.id();
+            #[cfg(not(feature = "gpt2"))]
+            if stores {
+                return Err(AllocError::Model("the gpt2 feature is off".to_string()));
+            }
+            #[cfg_attr(not(feature = "gpt2"), allow(unused_mut))]
             let mut done = seq.push_token(&mut self.pool)?;
+            #[cfg(feature = "gpt2")]
             if stores {
                 let (next_id, past_len) = {
                     let kv = self.kv.as_ref().expect("storage width was checked");
@@ -460,6 +473,7 @@ impl Scheduler {
     }
 }
 
+#[cfg(feature = "gpt2")]
 fn read_rows(pool: &BlockPool, seq: &Sequence, count: usize) -> Result<Vec<Vec<f32>>, AllocError> {
     let block_size = pool.block_size();
     let mut rows = Vec::with_capacity(count);
@@ -470,6 +484,7 @@ fn read_rows(pool: &BlockPool, seq: &Sequence, count: usize) -> Result<Vec<Vec<f
     Ok(rows)
 }
 
+#[cfg(feature = "gpt2")]
 fn write_row(
     pool: &mut BlockPool,
     seq: &Sequence,
@@ -482,6 +497,7 @@ fn write_row(
 }
 
 /// Run the prompt one token at a time and store each K/V row in the pool.
+#[cfg(feature = "gpt2")]
 fn prefill(
     pool: &mut BlockPool,
     seq: &Sequence,
@@ -499,15 +515,31 @@ fn prefill(
     last.ok_or_else(|| AllocError::Model("the prompt is empty".to_string()))
 }
 
-/// Encode `text` with GPT-2, run that model, and decode the ids it produced.
+/// Encode `text` with GPT-2, run that model and decode the ids it produced.
 ///
-/// The first call downloads `openai-community/gpt2`. At most `max_new_tokens`
-/// ids are appended. The end-of-text id stops the loop early. One sequence
-/// is running. The pool is released before this returns.
+/// Needs the `gpt2` feature. Without it this returns [`AllocError::Model`]
+/// and does not download weights. The first call with the feature downloads
+/// `openai-community/gpt2`. At most `max_new_tokens` ids are appended. The
+/// end-of-text id stops the loop early. One sequence is running. The pool is
+/// released before this returns.
 ///
 /// # Panics
 /// Panics if the prompt length or the full length does not fit in `u32`.
 pub fn generate(text: &str, max_new_tokens: u32) -> Result<Generated, AllocError> {
+    #[cfg(not(feature = "gpt2"))]
+    {
+        let _ = (text, max_new_tokens);
+        return Err(AllocError::Model("the gpt2 feature is off".to_string()));
+    }
+    #[cfg(feature = "gpt2")]
+    {
+        generate_with_gpt2(text, max_new_tokens)
+    }
+}
+
+/// Body of [`generate`] when the `gpt2` feature is on.
+#[cfg(feature = "gpt2")]
+fn generate_with_gpt2(text: &str, max_new_tokens: u32) -> Result<Generated, AllocError> {
     const BLOCK_SIZE: u32 = 16;
     let prompt = crate::model_encode(text)?;
     if prompt.is_empty() {
@@ -773,7 +805,9 @@ mod tests {
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
     }
 
+    #[cfg(feature = "gpt2")]
     #[test]
+    #[ignore = "downloads openai-community/gpt2"]
     fn a_generation_loop_writes_the_model_kv() {
         let model = crate::gpt2::model().unwrap();
         let prompt = model.encode("The").unwrap();
@@ -806,6 +840,7 @@ mod tests {
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
     }
 
+    #[cfg(feature = "gpt2")]
     fn assert_stored_row(sched: &Scheduler, index: u32, row: &[f32]) {
         let block_size = sched.pool().block_size();
         let seq = &sched.running()[0];
@@ -854,7 +889,9 @@ mod tests {
         assert_eq!(sched.pool().free_count(), sched.pool().capacity());
     }
 
+    #[cfg(feature = "gpt2")]
     #[test]
+    #[ignore = "downloads openai-community/gpt2"]
     fn generate_appends_ids_from_the_model() {
         let text = "The capital of France is";
         let out = generate(text, 1).unwrap();
@@ -868,5 +905,28 @@ mod tests {
         assert_eq!(prompt_only.ids, crate::model_encode("hi").unwrap());
         assert_eq!(prompt_only.text, "hi");
         assert_ne!(prompt_only.ids, crate::encode("hi"));
+    }
+
+    #[cfg(not(feature = "gpt2"))]
+    #[test]
+    fn generate_reports_that_the_feature_is_off() {
+        let err = generate("hi", 1).unwrap_err();
+        assert_eq!(
+            err,
+            AllocError::Model("the gpt2 feature is off".to_string())
+        );
+    }
+
+    #[cfg(not(feature = "gpt2"))]
+    #[test]
+    fn a_model_width_pool_does_not_load_weights_without_the_feature() {
+        let mut sched = Scheduler::new(BlockPool::with_storage(1, 4, crate::KV_FLOATS), 1);
+        let id = sched.add_tokens(&[1], 1);
+        assert_eq!(
+            sched.admit().unwrap_err(),
+            AllocError::Model("the gpt2 feature is off".to_string())
+        );
+        assert_eq!(sched.next_waiting().unwrap().id(), id);
+        assert_eq!(sched.pool().free_count(), sched.pool().capacity());
     }
 }
