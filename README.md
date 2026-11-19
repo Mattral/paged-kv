@@ -221,11 +221,15 @@ Paging is for a fixed pool and uneven lengths. The budget here is 65,536 token s
 
 Paged blocks fit 71 more sequences than reserving the longest request for every sequence, and 25 more than a buffer that doubles. Wasted slots are reserved room with no live token. Slots that were never reserved are not counted. The max-length reserve is the longest request in the trace, 14,089 tokens, paid for every sequence. Doubling rounds each length up to a power of two. Paging rounds up to 16.
 
-| Allocator | Sequences that fit | Slots wasted |
-| --- | --- | --- |
-| Paged, blocks of 16 | 75 | 541 |
-| Contiguous, capacity doubles | 50 | 24,496 |
-| Max-length reserve of 14,089 | 4 | 54,392 |
+One token in the GPT-2 small KV layout is 12 layers of K and V, each 768 `f32` values. That is 73,728 bytes per token. The fixed budget of 65,536 slots is 4.5 GiB. The packing bench still allocates no vectors. The byte columns scale those slot counts by this width. GiB waste is rounded to three decimals.
+
+![A max-length reserve wastes 3.735 GiB. Doubling wastes 1.682 GiB. Paged blocks waste 0.037 GiB.](docs/packing-waste.svg)
+
+| Allocator | Sequences that fit | Slots wasted | Bytes wasted | GiB wasted |
+| --- | --- | --- | --- | --- |
+| Paged, blocks of 16 | 75 | 541 | 39,886,848 | 0.037 |
+| Contiguous, capacity doubles | 50 | 24,496 | 1,806,041,088 | 1.682 |
+| Max-length reserve of 14,089 | 4 | 54,392 | 4,010,213,376 | 3.735 |
 
 These counts do not depend on a timer. `cargo bench --bench packing` prints them. `conversation_trace_fits_more_sequences_in_a_paged_pool` locks them.
 

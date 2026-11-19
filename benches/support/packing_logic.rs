@@ -25,6 +25,12 @@ pub const TRACE_REQUESTS: usize = 19_366;
 pub const TRACE_TOKEN_SUM: u64 = 26_450_535;
 /// Longest request in the embedded trace.
 pub const TRACE_MAX_LEN: u32 = 14_089;
+/// Bytes of one GPT-2 small token.
+///
+/// [`paged_kv::KV_FLOATS`] is 12 layers of K and V, 768 floats each.
+/// Each float is 4 bytes, so a token is 73,728 bytes. [`BUDGET_SLOTS`]
+/// times this width is exactly 4.5 GiB.
+pub const BYTES_PER_TOKEN: u64 = paged_kv::KV_FLOATS as u64 * std::mem::size_of::<f32>() as u64;
 
 /// Length of a short sequence in the old synthetic mix.
 pub const SHORT_LEN: u32 = 40;
@@ -94,6 +100,18 @@ pub fn measure_synthetic() -> Packing {
         doubling: doubling(&at),
         max_prealloc: max_prealloc(&at, SYNTHETIC_MAX_LEN),
     }
+}
+
+/// `slots` times [`BYTES_PER_TOKEN`].
+pub fn slot_bytes(slots: u64) -> u64 {
+    slots.saturating_mul(BYTES_PER_TOKEN)
+}
+
+/// `bytes` in GiB, rounded to three decimals, as thousandths of a GiB.
+pub fn gib_thousandths(bytes: u64) -> u64 {
+    let gib = 1024u128 * 1024 * 1024;
+    let rounded = (u128::from(bytes) * 1000 + gib / 2) / gib;
+    u64::try_from(rounded).expect("GiB thousandths fit in u64")
 }
 
 /// Length at `index` in the synthetic schedule.

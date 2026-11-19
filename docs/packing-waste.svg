@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" role="img">
+  <title>Paged blocks waste less of the same budget than doubling or a max-length reserve.</title>
+  <desc>The budget is 65536 slots, which is 4.5 GiB at 73728 bytes per GPT-2 small token. Paged waste is 0.037 GiB, doubling waste is 1.682 GiB, and a max-length reserve wastes 3.735 GiB. Bars are scaled to that 4.5 GiB budget.</desc>
+  <rect width="760" height="300" rx="12" fill="#ffffff" stroke="#e6e8ee"/>
+  <text x="32" y="36" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="600">Wasted GiB in the same 4.5 GiB budget</text>
+  <text x="32" y="58" fill="#5c6570" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">GPT-2 small is 73,728 bytes per token. Bars are reserved GiB with no live token.</text>
+
+  <text x="32" y="96" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Paged, blocks of 16</text>
+  <rect x="32" y="106" width="640" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="106" width="5.3" height="26" rx="4" fill="#e45756"/>
+  <text x="684" y="124" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">0.037</text>
+
+  <text x="32" y="166" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Contiguous, capacity doubles</text>
+  <rect x="32" y="176" width="640" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="176" width="239.2" height="26" rx="4" fill="#4c78a8"/>
+  <text x="684" y="194" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">1.682</text>
+
+  <text x="32" y="236" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Max-length reserve of 14,089</text>
+  <rect x="32" y="246" width="640" height="26" rx="4" fill="#eef1f4"/>
+  <rect x="32" y="246" width="531.3" height="26" rx="4" fill="#f28e2b"/>
+  <text x="684" y="264" fill="#1a1a1a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">3.735</text>
+</svg>
