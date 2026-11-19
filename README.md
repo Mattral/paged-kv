@@ -357,6 +357,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Claim | Test or bench |
 | --- | --- |
 | Allocate, free, and reuse the last freed id | `allocate_and_free_round_trip`, `most_recently_freed_block_is_reused_first` |
+| A seeded mix of allocate, free, share, and release keeps free plus live equal to capacity | `allocator_refcounts_stay_non_negative_under_a_seeded_mix` |
 | Tail waste, counted once when a block is shared | `partial_block_reports_tail_waste`, `shared_owners_do_not_double_count_tail_waste` |
 | Copy-on-write of a shared block | `cow_keeps_a_unique_block_in_place`, `cow_forks_a_shared_block_without_changing_the_other_owner` |
 | Prefix fork, including rollback | `fork_on_a_block_boundary_shares_only_the_covered_blocks`, `fork_of_the_whole_sequence_shares_the_tail_until_append`, `fork_inside_a_written_block_gets_a_private_boundary`, `fork_rolls_back_acquires_when_the_private_block_cannot_be_allocated` |
