@@ -2,7 +2,7 @@
 
 Paged KV-cache blocks and an FCFS scheduler.
 
-A synthetic packing run fits 607 sequences in paged blocks, 529 when each buffer doubles and 64 when every sequence reserves the max length.
+A packing run on the Azure conversation trace fits 75 sequences in paged blocks, 50 when each buffer doubles and 4 when every sequence reserves the longest request.
 
 ```sh
 cargo add paged-kv
@@ -14,7 +14,7 @@ The GPT-2 example stays off unless you enable it. The first run downloads `opena
 cargo run --example scheduled_attention --features gpt2 -- "The capital of France is"
 ```
 
-One sequence or a small batch. No model server. The packing benchmark is synthetic.
+One sequence or a small batch. No model server. The packing lengths are that conversation trace.
 
 `fake_attention` writes a fixed embedding and prints the scores.
 
@@ -215,19 +215,21 @@ cargo bench --bench scheduler_overhead
 
 ## How many sequences fit
 
-Paging is for a fixed pool and uneven lengths. The budget here is 65,536 token slots. Fifteen of every sixteen sequences are 40 tokens. Every sixteenth is 1,000. Each allocator admits sequences in that order and stops at the first one that does not fit. It does not skip a long sequence to take a shorter one behind it.
+Paging is for a fixed pool and uneven lengths. The budget here is 65,536 token slots. The lengths are the Azure conversation trace released with Splitwise (Patel et al., ISCA 2024): 19,366 requests in `AzureLLMInferenceTrace_conv.csv`, timestamps from 2023-11-16 18:15:46 through 19:14:08. Each length is context tokens plus generated tokens. That list is embedded in `benches/support/azure_conv_totals.txt` (CC-BY, Azure Public Dataset). Admission follows that file order and stops at the first request that does not fit. It does not skip a long request to take a shorter one behind it.
 
-![Paged blocks fit 607 sequences. Doubling fits 529. A max-length reserve fits 64.](docs/packing.svg)
+![Paged blocks fit 75 sequences. Doubling fits 50. A max-length reserve fits 4.](docs/packing.svg)
 
-Paged blocks fit 543 more sequences than reserving 1,024 slots for every sequence, and 78 more than a buffer that doubles. Wasted slots are reserved room with no live token. Slots that were never reserved are not counted. A max-length reserve pays 1,024 slots even for a 40-token sequence. Doubling rounds each length up to a power of two, 64 or 1,024. Paging rounds up to 16, so those lengths reserve 48 and 1,008.
+Paged blocks fit 71 more sequences than reserving the longest request for every sequence, and 25 more than a buffer that doubles. Wasted slots are reserved room with no live token. Slots that were never reserved are not counted. The max-length reserve is the longest request in the trace, 14,089 tokens, paid for every sequence. Doubling rounds each length up to a power of two. Paging rounds up to 16.
 
 | Allocator | Sequences that fit | Slots wasted |
 | --- | --- | --- |
-| Paged, blocks of 16 | 607 | 4,856 |
-| Contiguous, capacity doubles | 529 | 12,696 |
-| Max-length reserve of 1,024 | 64 | 59,136 |
+| Paged, blocks of 16 | 75 | 541 |
+| Contiguous, capacity doubles | 50 | 24,496 |
+| Max-length reserve of 14,089 | 4 | 54,392 |
 
-These counts do not depend on a timer. `cargo bench --bench packing` prints them. `skewed_lengths_fit_more_sequences_in_a_paged_pool` locks them.
+These counts do not depend on a timer. `cargo bench --bench packing` prints them. `conversation_trace_fits_more_sequences_in_a_paged_pool` locks them.
+
+Synthetic mix. The previous schedule was fifteen lengths of 40 and one of 1,000, repeating, with a max-length reserve of 1,024. That mix fit 607 paged, 529 doubling and 64 max-length, wasting 4,856, 12,696 and 59,136 slots. `synthetic_mix_fits_607_529_and_64` still locks those counts.
 
 ## What sharing a prefix adds
 
@@ -374,7 +376,7 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | `encode` then `decode` returns the same string | `encode_then_decode_round_trips` |
 | `generate` appends the id GPT-2's logits chose | `generate_appends_ids_from_the_model` |
 | Python `encode`, `decode`, `generate`, and `fill_tokens` | `a_python_caller_reserves_shares_and_preempts` |
-| A fixed budget fits more skewed sequences when blocks are paged | `skewed_lengths_fit_more_sequences_in_a_paged_pool`, `cargo bench --bench packing` |
+| A fixed budget fits more conversation-trace sequences when blocks are paged | `conversation_trace_fits_more_sequences_in_a_paged_pool`, `cargo bench --bench packing` |
 | One shared prefix fits more sequences in that same budget | `a_shared_prefix_fits_more_sequences`, `cargo bench --bench prefix_sharing` |
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |
