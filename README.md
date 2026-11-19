@@ -2,25 +2,40 @@
 
 Paged KV-cache blocks and an FCFS scheduler.
 
-A packing run on the Azure conversation trace fits 75 sequences in paged blocks, 50 when each buffer doubles and 4 when every sequence reserves the longest request.
+On the Azure conversation trace, paged blocks fit 75 sequences in 65,536 slots (4.5 GiB). A doubling buffer fits 50. Reserving the longest request for every sequence fits 4.
+
+| Allocator | Sequences that fit | Slots wasted | Bytes wasted | GiB wasted |
+| --- | --- | --- | --- | --- |
+| Paged, blocks of 16 | 75 | 541 | 39,886,848 | 0.037 |
+| Contiguous, capacity doubles | 50 | 24,496 | 1,806,041,088 | 1.682 |
+| Max-length reserve of 14,089 | 4 | 54,392 | 4,010,213,376 | 3.735 |
+
+## Try it
+
+Add the crate:
 
 ```sh
 cargo add paged-kv
 ```
 
-The GPT-2 example stays off unless you enable it. The first run downloads `openai-community/gpt2`.
+Run the GPT-2 example with the `gpt2` feature. The first run downloads `openai-community/gpt2`.
 
 ```sh
 cargo run --example scheduled_attention --features gpt2 -- "The capital of France is"
 ```
 
-One sequence or a small batch. No model server. The packing lengths are that conversation trace.
+`cargo run --example fake_attention` writes a fixed embedding and prints the scores. It does not download a model.
 
-`fake_attention` writes a fixed embedding and prints the scores.
+## What this is not
 
-```sh
-cargo run --example fake_attention
-```
+- The only checkpoint is `openai-community/gpt2`, stored as CPU `f32`. There is no GPU, fp16 or second model.
+- There is no serving server and no continuous batching. The example runs one sequence.
+- Prefix sharing and preemption happen only when you call them. A prompt that does not fit blocks the requests behind it.
+- `encode` and `decode` are a byte vocabulary. `generate` uses GPT-2's tokenizer.
+
+## A short call
+
+`BlockPool::new` tracks block ids only. `with_storage` also stores one `f32` vector per token slot. Call `release` when you are done. Dropping a table without `release` leaves the blocks marked in use until the pool is dropped.
 
 ```rust
 use paged_kv::{BlockPool, BlockTable, attend, fill_tokens};
@@ -41,11 +56,7 @@ fn main() -> Result<(), paged_kv::AllocError> {
 }
 ```
 
-`with_storage(4, 4, 8)` is 4 blocks, 4 token slots each, 8 floats per slot. The first half of a slot is K and the second half is V. `fill_tokens` grows the table and writes those halves. `release` gives the blocks back and zeroes the vectors. Dropping a table without `release` leaves the blocks marked in use until the pool is dropped.
-
-## Install the Python package
-
-From a clean virtualenv, in this repo:
+From a virtualenv in this repo:
 
 ```sh
 python3 -m venv .venv
@@ -53,220 +64,43 @@ python3 -m venv .venv
 .venv/bin/python -c 'import paged_kv; print(paged_kv.encode("hi"))'
 ```
 
-`encode` and `decode` are the byte vocabulary. `generate` needs the `gpt2` feature. The command in the opening is that path.
+`encode("hi")` returns `[104, 105]`. `generate` needs the `gpt2` feature.
 
-```python
-import paged_kv
-
-assert paged_kv.encode("hi") == [104, 105]
-ids, text = paged_kv.generate("The capital of France is", 1)
-assert ids[-1] == 262
-assert text.endswith(" the")
-```
-
-`generate` runs one sequence. A storage scheduler can hold a few sequences, and each one runs its own forward. There is no fused batch and no continuous batching of a model server. Failures raise `ValueError`.
-
-The same package can also fill slots and score them:
-
-```python
-import paged_kv
-
-pool = paged_kv.BlockPool.with_storage(4, 2, 4)
-table = paged_kv.BlockTable()
-paged_kv.fill_tokens(pool, table, 2, [1, 2, 3])
-scores, context = paged_kv.attend(pool, table, 2)
-assert len(scores) == 3 and abs(sum(scores) - 1.0) < 1e-5
-assert len(context) == 2
-block, slot = table.token_loc(pool, 2)
-pool.set_kv(block, slot, [9.0, 9.0, 9.0, 9.0])
-table.release(pool)
-```
-
-`pip install` builds the extension. These calls are covered by `a_python_caller_reserves_shares_and_preempts`.
-
-## Write your own vector
-
-```rust
-use paged_kv::{BlockPool, BlockTable};
-
-fn main() -> Result<(), paged_kv::AllocError> {
-    let mut pool = BlockPool::with_storage(8, 16, 4);
-    let mut table = BlockTable::new();
-    table.grow(&mut pool, 20)?;
-
-    let loc = table.token_loc(&pool, 19)?;
-    pool.kv_mut(loc.block, loc.slot)?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-
-    table.release(&mut pool)?;
-    Ok(())
-}
-```
-
-`token_loc` is the handle a forward pass writes through. A block another sequence still shares cannot be written in place. `cow` copies the filled slots into a private block first. `BlockPool::new` is the metadata-only pool used by the benches below. It has no vectors, and `kv_mut` returns an error.
-
-## Batch a few sequences
-
-The scheduler queues requests and reserves blocks. A metadata pool only tracks block ids. A storage pool whose width is GPT-2's K and V (`18432` floats: 12 layers, K and V, 768 each) runs `openai-community/gpt2` on admit and on each step when the `gpt2` feature is on, and writes those vectors into the slots. Any other width is rejected before the download. The example above is that path, one sequence at a time. A small batch still runs one forward per sequence. The cost charts measure bookkeeping time on the metadata pool. Paging still matters when many sequences share one pool. One sequence whose length you already know is a simpler problem, and [`ContiguousTable`](#one-contiguous-length) is faster at bookkeeping. The cost charts below are that comparison. The packing chart is how many sequences fit in one budget.
-
-```rust
-use paged_kv::{BlockPool, Scheduler};
-
-fn main() -> Result<(), paged_kv::AllocError> {
-    let mut sched = Scheduler::new(BlockPool::new(32, 16), 1);
-    let first = sched.add(32, 1);
-    let second = sched.add(16, 1);
-
-    assert_eq!(sched.admit()?, vec![first]);
-    assert_eq!(sched.next_waiting().map(|seq| seq.id()), Some(second));
-
-    let step = sched.step()?;
-    assert_eq!(step.finished, vec![first]);
-    assert_eq!(sched.retire()?, vec![first]);
-
-    assert_eq!(sched.admit()?, vec![second]);
-    assert_eq!(sched.step()?.finished, vec![second]);
-    assert_eq!(sched.retire()?, vec![second]);
-    assert!(sched.is_idle());
-    Ok(())
-}
-```
-
-`add` only queues the request. `admit` reserves the whole prompt for the oldest waiting sequence, while the batch has room and the prompt fits. A prompt that does not fit stays at the head of the queue, and smaller requests behind it wait. `step` appends one token to every decoding sequence, or to none of them if the pool cannot cover the whole batch. A finished sequence keeps its batch slot until `retire`. A request with `max_new_tokens == 0` finishes as soon as its prompt is reserved.
-
-When the batch is full, or the next prompt needs memory the batch is holding, you can preempt the newest decoding sequence. The oldest one stays. Admission does not preempt on its own. The preempted sequence goes to the back of the queue, so the request that was stuck at the front can run.
-
-```rust
-use paged_kv::{BlockPool, PreemptPolicy, Scheduler};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut sched = Scheduler::new(BlockPool::new(32, 16), 2);
-    sched.add(16, 4);
-    sched.add(16, 4);
-    sched.admit()?;
-    // Newest decoding sequence. Pause keeps its blocks.
-    sched.preempt(PreemptPolicy::Pause)?;
-    // The older one is still decoding. Recompute frees its blocks.
-    sched.preempt(PreemptPolicy::Recompute)?;
-    Ok(())
-}
-```
-
-`Pause` keeps that sequence's blocks and the tokens it already generated. The next time it is admitted, decode continues. This frees a batch slot and does not free pool memory. `Recompute` returns the blocks to the pool and forgets the generated tokens. The sequence is prefilled again later. This is the policy that makes room for another prompt.
-
-## Share a prompt prefix
-
-The cache never reads token ids. You hash the prompt, or a prefix of it, and use that `u64` as the key.
-
-```rust
-use paged_kv::{BlockPool, BlockTable, PrefixCache};
-
-fn main() -> Result<(), paged_kv::AllocError> {
-    let mut pool = BlockPool::new(32, 16);
-    let mut table = BlockTable::new();
-    table.grow(&mut pool, 32)?;
-
-    let prompt_hash = 0xabc;
-    let mut cache = PrefixCache::new();
-    cache.insert(&mut pool, prompt_hash, &table)?;
-
-    let child = cache
-        .lookup(&mut pool, prompt_hash, 32)?
-        .expect("the prefix was cached");
-    assert_eq!(cache.hit_rate(), 1.0);
-    child.release(&mut pool)?;
-
-    cache.clear(&mut pool)?;
-    table.release(&mut pool)?;
-    Ok(())
-}
-```
-
-A lookup that forks a cached prefix is a hit. A missing key, or a cached table shorter than the prefix you asked for, is a miss. `hit_rate` is hits divided by hits plus misses, and it is `0.0` before the first lookup. `clear` returns the cached blocks. The scheduler does not consult this cache. Sharing is a step you take yourself.
-
-## One contiguous length
-
-```rust
-use paged_kv::ContiguousTable;
-
-fn main() -> Result<(), paged_kv::AllocError> {
-    let mut span = ContiguousTable::new();
-    span.reserve_exact(260);
-    span.grow(260)?;
-    assert_eq!(span.capacity(), 260);
-    Ok(())
-}
-```
-
-There is no pool, no free list, and no sharing. `reserve_exact` sets the capacity to that length. `grow` without a reserve doubles capacity until the length fits, the way a normal buffer grows. `grow` does not shrink the span.
-
-## Run the checks
-
-The Python module has the same scheduler. `preempt("pause")` keeps blocks. `preempt("recompute")` frees them.
-
-```sh
-cargo test
-cargo test -p paged-kv-py
-cargo bench --bench packing
-cargo bench --bench prefix_sharing
-cargo bench --bench paged_vs_contiguous
-cargo bench --bench alloc_load
-cargo bench --bench scheduler_overhead
-```
-
-## How many sequences fit
-
-Paging is for a fixed pool and uneven lengths. The budget here is 65,536 token slots. The lengths are the Azure conversation trace released with Splitwise (Patel et al., ISCA 2024): 19,366 requests in `AzureLLMInferenceTrace_conv.csv`, timestamps from 2023-11-16 18:15:46 through 19:14:08. Each length is context tokens plus generated tokens. That list is embedded in `benches/support/azure_conv_totals.txt` (CC-BY, Azure Public Dataset). Admission follows that file order and stops at the first request that does not fit. It does not skip a long request to take a shorter one behind it.
+## Where the table comes from
 
 ![Paged blocks fit 75 sequences. Doubling fits 50. A max-length reserve fits 4.](docs/packing.svg)
 
-Paged blocks fit 71 more sequences than reserving the longest request for every sequence, and 25 more than a buffer that doubles. Wasted slots are reserved room with no live token. Slots that were never reserved are not counted. The max-length reserve is the longest request in the trace, 14,089 tokens, paid for every sequence. Doubling rounds each length up to a power of two. Paging rounds up to 16.
-
-One token in the GPT-2 small KV layout is 12 layers of K and V, each 768 `f32` values. That is 73,728 bytes per token. The fixed budget of 65,536 slots is 4.5 GiB. The packing bench still allocates no vectors. The byte columns scale those slot counts by this width. GiB waste is rounded to three decimals.
-
 ![A max-length reserve wastes 3.735 GiB. Doubling wastes 1.682 GiB. Paged blocks waste 0.037 GiB.](docs/packing-waste.svg)
 
-| Allocator | Sequences that fit | Slots wasted | Bytes wasted | GiB wasted |
-| --- | --- | --- | --- | --- |
-| Paged, blocks of 16 | 75 | 541 | 39,886,848 | 0.037 |
-| Contiguous, capacity doubles | 50 | 24,496 | 1,806,041,088 | 1.682 |
-| Max-length reserve of 14,089 | 4 | 54,392 | 4,010,213,376 | 3.735 |
+Lengths are context tokens plus generated tokens from the Azure conversation trace released with Splitwise (Patel et al., ISCA 2024): 19,366 requests from 2023-11-16 18:15:46 through 19:14:08, admitted in that order. The list is `benches/support/azure_conv_totals.txt` (CC-BY, Azure Public Dataset). Admission stops at the first request that does not fit.
 
-These counts do not depend on a timer. `cargo bench --bench packing` prints them. `conversation_trace_fits_more_sequences_in_a_paged_pool` locks them.
+One GPT-2 small token is 12 layers of K and V, 768 `f32` values each. That is 73,728 bytes, so 65,536 slots are 4.5 GiB. GiB waste is rounded to three decimals. The packing bench stores no vectors. `cargo bench --bench packing` prints the counts.
 
-Synthetic mix. The previous schedule was fifteen lengths of 40 and one of 1,000, repeating, with a max-length reserve of 1,024. That mix fit 607 paged, 529 doubling and 64 max-length, wasting 4,856, 12,696 and 59,136 slots. `synthetic_mix_fits_607_529_and_64` still locks those counts.
+The older synthetic mix was fifteen lengths of 40 and one of 1,000, repeating, with a reserve of 1,024. It fit 607 paged, 529 doubling and 64 max-length, wasting 4,856, 12,696 and 59,136 slots.
 
-## What sharing a prefix adds
+<details>
+<summary>Prefix sharing fits 1,354 sequences instead of 117. Bookkeeping timings.</summary>
 
-Same budget, 65,536 slots, blocks of 16. Each sequence is a 512-token prefix and a 48-token tail. The prefix ends on a block boundary, so a shared copy covers it exactly.
+Same budget, 65,536 slots, blocks of 16. Each sequence is a 512-token prefix and a 48-token tail.
 
 ![Storing the prefix once fits 1,354 sequences. Storing it on every sequence fits 117.](docs/prefix-sharing.svg)
-
-Without sharing, 117 sequences fit. With the prefix stored once, 1,354 fit. That is 1,237 more. Each private run spends 560 slots per sequence. Each shared run spends 512 slots once, then 48 slots per sequence. Neither run wastes slots inside a block. The gain is the prefix that is not copied.
 
 | | Sequences that fit |
 | --- | --- |
 | Prefix stored on every sequence | 117 |
 | Prefix stored once | 1,354 |
 
-`cargo bench --bench prefix_sharing` prints both counts. `a_shared_prefix_fits_more_sequences` locks them.
+That is 1,237 more. `cargo bench --bench prefix_sharing` prints both counts.
 
-## What the bookkeeping costs
-
-The counts above are the benefit: how many sequences fit. The timings here are the cost of the bookkeeping, not that benefit.
-
-These benches call `BlockPool::new`, so they store no vectors and copy no KV bytes. The numbers are the cost of updating lengths, free lists, and block ids. Each chart is one release run on an x86-64 desktop CPU, rustc 1.99.1: 3 warmup runs, then the median of 21.
+The timings below are bookkeeping on the metadata pool, not the packing result. Each chart is one release run on an x86-64 desktop CPU, rustc 1.99.1: 3 warmup runs, then the median of 21.
 
 ![One token at a time, paged blocks take much longer than a doubling length. The ranges do not overlap.](docs/paged-vs-contiguous.svg)
 
-512 sequences grow to 260 tokens, one token at a time, and stay live together. Paged blocks take 5.42 ms. A contiguous length that doubles takes 0.25 ms. That is about 22×. The slowest doubling run, 0.41 ms, is still under the fastest paged run, 5.19 ms. Dividing the paged median by 512 × 260 steps is about 40 ns of bookkeeping per step.
-
-Each paged step may pop the free list, update a used-slot count, and copy the block-id list so a failed `grow` can roll back. A new block is handed out every 16 tokens. The contiguous side adds one to a length.
+512 sequences grow to 260 tokens, one token at a time, and stay live together. Paged blocks take 5.42 ms. A contiguous length that doubles takes 0.25 ms. That is about 22×.
 
 ![Exact reserve holds 260 slots, paging holds 272, and doubling holds 512.](docs/reserved-slots.svg)
 
-Doubling is the fast bar, and it is also the roomiest. For one sequence of 260 tokens, an exact reserve holds 260 slots, pages of 16 hold 272 (a 12-slot tail), and doubling lands on 512. Paging reserves less spare room than geometric growth. Knowing the length in advance reserves less than paging.
-
-Asking for all 260 tokens in one call, instead of stepping, brings the paged median to 0.83 ms (min 0.81, max 1.08). The contiguous exact path writes one capacity: median 2.8 µs. One sample spiked to 20 µs, and that spike is still below every paged sample. About 290× at the medians. This is one reservation, not the decode loop.
+For one sequence of 260 tokens, an exact reserve holds 260 slots, pages of 16 hold 272, and doubling holds 512.
 
 | Policy | min | median | max |
 | --- | --- | --- | --- |
@@ -279,80 +113,25 @@ Asking for all 260 tokens in one call, instead of stepping, brings the paged med
 
 ![The first fill and a recycled free list overlap around 6 ns per block.](docs/alloc-load.svg)
 
-`cargo bench --bench alloc_load` allocates 100,000 blocks, marks each one full, and frees them. Pool construction is outside the timer. The first pass is 6.6 ns per block at the median (6.1 to 10.8). The second pass, on a warm free list, is 5.6 ns (5.4 to 9.1). The ranges overlap, so recycling is in the same band as the first fill.
+`cargo bench --bench alloc_load` allocates 100,000 blocks, marks each one full, and frees them. The first pass is 6.6 ns per block at the median (6.1 to 10.8). The second pass is 5.6 ns (5.4 to 9.1). The ranges overlap.
 
 ![The scheduler's whole range sits to the right of the slowest one-sequence run.](docs/scheduler-overhead.svg)
 
-`cargo bench --bench scheduler_overhead` runs 256 sequences of 128 prompt tokens and 64 generated tokens, block size 16, batch of 16, pool of 192 blocks. Both paths use the paged pool. The one-sequence loop finishes a sequence before starting the next. The scheduler keeps 16 live.
+`cargo bench --bench scheduler_overhead` runs 256 sequences of 128 prompt tokens and 64 generated tokens, block size 16, batch of 16, pool of 192 blocks. Both paths use the paged pool.
 
 | Path | min | median | max |
 | --- | --- | --- | --- |
 | One sequence at a time | 0.824 ms | 0.836 ms | 1.021 ms |
 | Scheduler, batch of 16 | 1.148 ms | 1.207 ms | 1.554 ms |
 
-The scheduler median is 1.44× the one-sequence loop, and every scheduler run is slower than the slowest one-sequence run. Two earlier runs on this machine were 1.38× and 1.38×. On bookkeeping alone, the queue costs more than it saves. There is no model step underneath for that cost to hide behind.
+The scheduler median is 1.44× the one-sequence loop. Every scheduler run is slower than the slowest one-sequence run.
 
-## What these numbers leave out
+These benches do not fill `f32` vectors or run attention. The timing runs do not share a prefix.
 
-- The benches use the metadata pool. Filling the `f32` vectors, and the attention step, are not in these timings.
-- Every sequence in the paged-versus-contiguous bench stays live at once. A pool that is filled, freed, and filled again over a long run is a different story. The allocate/free bench is the one that recycles, and it shows no clear saving.
-- The timing benches do not share a prefix. The extra sequences from storing one prefix once are counted above, not in these timings.
-- The scheduler adds its own cost on top of paging. Head-of-line blocking and all-or-nothing steps are part of that design.
+</details>
 
-## What this is not
-
-- A choice of models. The only checkpoint is `openai-community/gpt2`. `encode` and `decode` are still a byte vocabulary. `generate` uses GPT-2's tokenizer. `fill_tokens` still writes a fixed embedding for a caller who does not use the scheduler. `attend` reads whatever is stored.
-- A GPU tensor, or fp16. Storage is one `f32` vector per token slot on the CPU.
-- A serving server. There is no continuous batching of this model. `generate` and the example run one sequence. `Scheduler::step` can hold a few sequences, and each one runs its own forward.
-- A multi-device cache.
-- Automatic prefix sharing. The cache is there. `Scheduler::admit` does not call it.
-- Automatic preemption. `preempt` runs when you call it.
-- Chunked prefill. Admission reserves the whole prompt.
-- A skip of a prompt that does not fit. The requests behind it wait.
-
-## How the pool is laid out
-
-`BlockPool::new(num_blocks, block_size)` builds three parallel structures, indexed by `BlockId`:
-
-| State | Meaning |
-| --- | --- |
-| `refcounts[id]` | Live owners. `0` means the block is free. |
-| `used[id]` | Initialized token slots in that block, at most `block_size`. |
-| `free_list` | Stack of free ids. `allocate` pops it. `free` pushes an id when its refcount hits zero. |
-
-A fresh pool is stacked from high ids down to zero, so the first allocations are `0, 1, 2, ...`. After that, the most recently freed id is handed out next.
-
-Blocks are interchangeable. A hole on the free list can be used by any request, so the pool has no external fragmentation. The waste it reports is internal: `block_size - used` on each live block, counted once even when several owners share it. An idle pool reports zero. A freshly allocated block starts at `used == 0`, so it counts as fully wasted until the caller fills it.
-
-`allocate` returns one block with refcount 1. `acquire` adds an owner. `free` drops one owner and recycles the block at zero. A second free of an already free block is rejected. `cow` returns the same id when the refcount is 1. When the block is shared, it allocates a new block, copies the initialized length, copies any stored vectors for those slots, and drops one reference to the original. If that allocation fails, the shared block is unchanged. Freeing the last owner zeroes a stored block.
-
-`BlockTable` holds one reference per block it lists. Full blocks are marked fully used. The tail holds the remainder. `grow` does not shorten a table. If the pool cannot cover the whole request, the table and the pool stay as they were.
-
-`fork_prefix(prefix_len)` builds another table for the first `prefix_len` tokens:
-
-- A prefix that ends on a block boundary shares those full blocks.
-- A prefix that covers the whole table also shares a partial tail. The next append into that tail copy-on-writes it.
-- A prefix that stops inside a block the parent has already written past shares the full blocks before that point and gets a new private block for the partial length.
-- A failure rolls the acquires back. A zero-length prefix allocates nothing. A prefix past the table length changes no refcount.
-
-```rust
-use paged_kv::{BlockPool, BlockTable};
-
-fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
-    let mut pool = BlockPool::new(8, 16);
-    let mut parent = BlockTable::new();
-    parent.grow(&mut pool, 20)?;
-
-    let mut child = parent.fork_prefix(&mut pool, 20)?;
-    child.grow(&mut pool, 21)?;
-
-    child.release(&mut pool)?;
-    parent.release(&mut pool)?;
-    Ok(())
-}
-```
-
-## Where a claim is checked
+<details>
+<summary>Where a claim is checked</summary>
 
 | Claim | Test or bench |
 | --- | --- |
@@ -386,3 +165,5 @@ fn share_a_prefix() -> Result<(), paged_kv::AllocError> {
 | Paged versus contiguous, including slot counts | `cargo bench --bench paged_vs_contiguous` |
 | Allocate and free under load | `cargo bench --bench alloc_load` |
 | Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |
+
+</details>
