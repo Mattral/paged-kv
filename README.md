@@ -168,3 +168,14 @@ These benches do not fill `f32` vectors or run attention. The timing runs do not
 | Scheduler versus one sequence | `cargo bench --bench scheduler_overhead` |
 
 </details>
+
+## Status
+
+This is a measured reference implementation. It is not a serving stack.
+
+Possible next steps (not planned):
+- Packing benchmark on additional real traces
+- Property-test expansion
+- A separate GPU paged-attention kernel that reads through the block table
+
+PRs that keep the honest limits and do not turn this into a framework are welcome. Review bandwidth is limited.
