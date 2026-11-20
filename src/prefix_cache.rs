@@ -74,6 +74,14 @@ impl PrefixCache {
         self.entries.is_empty()
     }
 
+    /// Token length stored at `key`, if any.
+    ///
+    /// This is not a lookup. It does not change [`PrefixCache::hits`] or
+    /// [`PrefixCache::misses`].
+    pub(crate) fn cached_len(&self, key: u64) -> Option<u32> {
+        self.entries.get(&key).map(BlockTable::len)
+    }
+
     /// Store a fork of `source` under `key`.
     ///
     /// The cached fork covers the whole source table, so the caller can

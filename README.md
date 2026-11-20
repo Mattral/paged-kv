@@ -30,7 +30,7 @@ cargo run --example scheduled_attention --features gpt2 -- "The capital of Franc
 
 - The only checkpoint is `openai-community/gpt2`, stored as CPU `f32`. There is no GPU, fp16 or second model.
 - There is no serving server and no continuous batching. The example runs one sequence.
-- Prefix sharing and preemption happen only when you call them. A prompt that does not fit blocks the requests behind it.
+- Admission reuses full prefix blocks when a prompt shares them with one already admitted, and keeps those blocks cached. `PrefixCache` still takes a caller-supplied hash. Preemption happens only when you call it. A prompt that does not fit blocks the requests behind it.
 - `encode` and `decode` are a byte vocabulary. `generate` uses GPT-2's tokenizer.
 
 ## A short call
@@ -146,6 +146,7 @@ These benches do not fill `f32` vectors or run attention. The timing runs do not
 | Doubling and exact reserve | `grow_doubles_capacity_until_the_length_fits`, `reserve_exact_does_not_double_past_the_request` |
 | Arrival order, and a full batch | `admission_follows_arrival_order_and_stops_at_the_batch_size` |
 | A prompt that does not fit blocks the queue | `a_prompt_that_does_not_fit_blocks_smaller_requests_behind_it` |
+| Admission reuses a shared prefix | `admission_reuses_a_shared_prefix_without_a_manual_cache_call` |
 | A finished sequence keeps its slot | `a_finished_sequence_keeps_its_slot_until_retire` |
 | `step` is all or nothing | `step_is_all_or_nothing_when_the_batch_cannot_grow` |
 | A fake generation loop frees every block | `fake_generation_joins_sequences_and_frees_every_block` |

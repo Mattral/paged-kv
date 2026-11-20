@@ -3,7 +3,8 @@
 //! [`BlockPool`] tracks fixed-size blocks. [`BlockTable`] maps one sequence's
 //! tokens onto those blocks and can fork a shared prefix. [`PrefixCache`]
 //! stores those forks under a caller-supplied key and counts hits.
-//! [`Scheduler`] admits sequences first-come, first-served, retires them
+//! [`Scheduler`] admits sequences first-come, first-served, reuses full
+//! prefix blocks when a later prompt shares that token prefix, retires them
 //! when their token budget is spent, and can preempt the newest decoding
 //! sequence when the caller asks. [`BlockPool::new`] tracks ids only.
 //! [`BlockPool::with_storage`] also keeps one `f32` vector per token slot,

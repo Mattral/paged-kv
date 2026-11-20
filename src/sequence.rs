@@ -133,6 +133,37 @@ impl Sequence {
         Ok(())
     }
 
+    /// Use `shared` as the prompt prefix and allocate only the missing tail.
+    ///
+    /// `shared` is released if the tail cannot be allocated. The sequence
+    /// stays waiting in that case.
+    pub(crate) fn adopt_prompt(
+        &mut self,
+        pool: &mut BlockPool,
+        mut shared: BlockTable,
+    ) -> Result<(), AllocError> {
+        debug_assert_eq!(self.phase, Phase::Waiting);
+        debug_assert!(self.table.is_empty());
+        debug_assert!(shared.len() <= self.prompt_len);
+        if shared.len() < self.prompt_len {
+            if let Err(err) = shared.grow(pool, self.prompt_len) {
+                let _ = shared.release(pool);
+                return Err(err);
+            }
+        }
+        self.table = shared;
+        self.enter_after_prompt();
+        Ok(())
+    }
+
+    pub(crate) fn fork_prefix(
+        &self,
+        pool: &mut BlockPool,
+        prefix_len: u32,
+    ) -> Result<BlockTable, AllocError> {
+        self.table.fork_prefix(pool, prefix_len)
+    }
+
     /// Where logical token `index` lives.
     ///
     /// `block_size` must be the block size of the pool this sequence grew on.

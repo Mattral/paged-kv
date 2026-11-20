@@ -9,10 +9,12 @@
 //! them if the pool cannot cover the whole batch. Finished sequences keep
 //! their batch slot until [`Scheduler::retire`] releases their blocks.
 //!
-//! The scheduler does not share prefixes across sequences. Prompt tokens are
-//! reserved in full at admission. There is no chunked prefill. Preemption is
-//! a caller hook: [`Scheduler::preempt`] removes the newest decoding
-//! sequence. Admission never preempts on its own.
+//! Admission hashes the token ids from [`Scheduler::add_tokens`] and reuses
+//! full prefix blocks when a cached prompt shares that prefix. A partial
+//! tail stays private. [`crate::PrefixCache`] still accepts a caller-supplied
+//! hash. Prompt tokens are reserved in full at admission. There is no
+//! chunked prefill. Preemption is a caller hook: [`Scheduler::preempt`]
+//! removes the newest decoding sequence. Admission never preempts on its own.
 //!
 //! A pool from [`BlockPool::new`] only tracks block ids. A pool from
 //! [`BlockPool::with_storage`] whose width is [`KV_FLOATS`](crate::KV_FLOATS)
@@ -27,13 +29,11 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::sequence::{Phase, Sequence, SequenceId};
-use crate::{AllocError, BlockPool};
+use crate::{AllocError, BlockPool, PrefixCache};
 
 /// Token ids and the last attention scores for sequences on a storage pool.
 #[derive(Debug)]
 struct KvTrack {
-    /// Prompt ids from [`Scheduler::add_tokens`]. Absent means `1..=prompt_len`.
-    prompts: HashMap<SequenceId, Vec<u32>>,
     /// Ids written into slots, prompt first, then generated tokens.
     written: HashMap<SequenceId, Vec<u32>>,
     /// Next id chosen by the model, waiting for the following step.
@@ -112,7 +112,13 @@ pub struct Scheduler {
     next_id: u64,
     waiting: VecDeque<Sequence>,
     running: Vec<Sequence>,
-    /// Present only when the pool stores vectors of an even width.
+    /// Prompt ids from [`Scheduler::add_tokens`].
+    prompts: HashMap<SequenceId, Vec<u32>>,
+    /// Full prefix blocks, keyed by a hash of the token prefix.
+    prefixes: PrefixCache,
+    /// Tokens for each cached hash. A colliding hash is not reused.
+    prefix_tokens: HashMap<u64, Vec<u32>>,
+    /// Present only when the pool stores vectors of model width.
     kv: Option<KvTrack>,
 }
 
@@ -125,7 +131,6 @@ impl Scheduler {
         assert!(max_batch > 0, "max_batch must be non-zero");
         let kv = match pool.floats_per_token() {
             Some(width) if width == crate::KV_FLOATS => Some(KvTrack {
-                prompts: HashMap::new(),
                 written: HashMap::new(),
                 scores: HashMap::new(),
                 context: HashMap::new(),
@@ -139,6 +144,9 @@ impl Scheduler {
             next_id: 0,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            prompts: HashMap::new(),
+            prefixes: PrefixCache::new(),
+            prefix_tokens: HashMap::new(),
             kv,
         }
     }
@@ -162,7 +170,7 @@ impl Scheduler {
     }
 
     fn prompt_ids(&self, id: SequenceId, prompt_len: u32) -> Vec<u32> {
-        if let Some(ids) = self.kv.as_ref().and_then(|kv| kv.prompts.get(&id)) {
+        if let Some(ids) = self.prompts.get(&id) {
             return ids.clone();
         }
         (1..=prompt_len).collect()
@@ -185,17 +193,16 @@ impl Scheduler {
 
     /// Queue a prompt made of these token ids. This does not reserve blocks.
     ///
-    /// The prompt length is `token_ids.len()`. On a storage pool, admission
-    /// writes these ids. On a metadata pool they only supply that length.
+    /// The prompt length is `token_ids.len()`. Admission hashes these ids and
+    /// reuses full prefix blocks when an earlier prompt has the same prefix.
+    /// On a storage pool, admission also writes these ids.
     ///
     /// # Panics
     /// Panics if `token_ids.len()` does not fit in `u32`.
     pub fn add_tokens(&mut self, token_ids: &[u32], max_new_tokens: u32) -> SequenceId {
         let prompt_len = u32::try_from(token_ids.len()).expect("prompt length fits in u32");
         let id = self.add(prompt_len, max_new_tokens);
-        if let Some(kv) = self.kv.as_mut() {
-            kv.prompts.insert(id, token_ids.to_vec());
-        }
+        self.prompts.insert(id, token_ids.to_vec());
         id
     }
 
@@ -231,9 +238,11 @@ impl Scheduler {
     /// queue.
     ///
     /// A paused sequence already holds its blocks. Admission resumes it
-    /// without asking the pool for more. On a GPT-2 storage pool, a fresh
-    /// admission writes the prompt's K and V from the model and runs it.
-    /// A resumed sequence is not rewritten.
+    /// without asking the pool for more. A prompt passed to
+    /// [`Scheduler::add_tokens`] reuses cached full blocks of a matching
+    /// token prefix and allocates only the private tail. On a GPT-2 storage
+    /// pool, a fresh admission writes K and V for the tokens that were not
+    /// reused. A resumed sequence is not rewritten.
     pub fn admit(&mut self) -> Result<Vec<SequenceId>, AllocError> {
         let stores = self.stores_model_kv()?;
         let mut admitted = Vec::new();
@@ -243,7 +252,9 @@ impl Scheduler {
                 break;
             };
             if head.phase() != Phase::Paused {
-                let need = BlockPool::blocks_needed(head.prompt_len(), block_size);
+                let shared_len = self.shared_prefix_len(head.id(), head.prompt_len());
+                let need = BlockPool::blocks_needed(head.prompt_len(), block_size)
+                    .saturating_sub(BlockPool::blocks_needed(shared_len, block_size));
                 if self.pool.free_count() < need {
                     break;
                 }
@@ -251,48 +262,63 @@ impl Scheduler {
             let mut seq = self.waiting.pop_front().expect("front was observed");
             if seq.phase() == Phase::Paused {
                 seq.resume();
-            } else if stores {
-                let tokens = self.prompt_ids(seq.id(), seq.prompt_len());
-                if tokens.is_empty() && seq.max_new_tokens() > 0 {
-                    self.waiting.push_front(seq);
-                    return Err(AllocError::Model("the prompt is empty".to_string()));
+            } else {
+                if stores {
+                    let tokens = self.prompt_ids(seq.id(), seq.prompt_len());
+                    if tokens.is_empty() && seq.max_new_tokens() > 0 {
+                        self.waiting.push_front(seq);
+                        return Err(AllocError::Model("the prompt is empty".to_string()));
+                    }
+                    if let Some(id) = tokens.iter().copied().find(|id| *id >= crate::MODEL_VOCAB) {
+                        self.waiting.push_front(seq);
+                        return Err(AllocError::TokenOutOfVocab {
+                            id,
+                            vocab: crate::MODEL_VOCAB,
+                        });
+                    }
+                    #[cfg(not(feature = "gpt2"))]
+                    if !tokens.is_empty() {
+                        self.waiting.push_front(seq);
+                        return Err(AllocError::Model("the gpt2 feature is off".to_string()));
+                    }
                 }
-                if let Some(id) = tokens.iter().copied().find(|id| *id >= crate::MODEL_VOCAB) {
-                    self.waiting.push_front(seq);
-                    return Err(AllocError::TokenOutOfVocab {
-                        id,
-                        vocab: crate::MODEL_VOCAB,
-                    });
-                }
-                #[cfg(not(feature = "gpt2"))]
-                if !tokens.is_empty() {
-                    self.waiting.push_front(seq);
-                    return Err(AllocError::Model("the gpt2 feature is off".to_string()));
-                }
-                if let Err(err) = seq.allocate_prompt(&mut self.pool) {
+                let shared_len = self.shared_prefix_len(seq.id(), seq.prompt_len());
+                if let Err(err) = self.reserve_prompt(&mut seq, shared_len) {
                     self.waiting.push_front(seq);
                     return Err(err);
                 }
                 #[cfg(feature = "gpt2")]
-                if !tokens.is_empty() {
-                    let forward = match prefill(&mut self.pool, &seq, &tokens) {
-                        Ok(forward) => forward,
-                        Err(err) => {
-                            let _ = seq.discard_progress(&mut self.pool);
-                            self.waiting.push_front(seq);
-                            return Err(err);
-                        }
-                    };
-                    let id = seq.id();
-                    let kv = self.kv.as_mut().expect("storage width was checked");
-                    kv.pending.insert(id, forward.next_token);
-                    kv.written.insert(id, tokens);
-                    kv.scores.insert(id, forward.scores);
-                    kv.context.insert(id, forward.context);
+                if stores {
+                    let tokens = self.prompt_ids(seq.id(), seq.prompt_len());
+                    if !tokens.is_empty() {
+                        let forward = match prefill(&mut self.pool, &seq, &tokens, shared_len) {
+                            Ok(forward) => forward,
+                            Err(err) => {
+                                let _ = seq.discard_progress(&mut self.pool);
+                                self.waiting.push_front(seq);
+                                return Err(err);
+                            }
+                        };
+                        let id = seq.id();
+                        let kv = self.kv.as_mut().expect("storage width was checked");
+                        kv.pending.insert(id, forward.next_token);
+                        kv.written.insert(id, tokens);
+                        kv.scores.insert(id, forward.scores);
+                        kv.context.insert(id, forward.context);
+                    }
                 }
-            } else if let Err(err) = seq.allocate_prompt(&mut self.pool) {
-                self.waiting.push_front(seq);
-                return Err(err);
+                if let Err(err) = self.remember_prefix(&seq) {
+                    let id = seq.id();
+                    let _ = seq.discard_progress(&mut self.pool);
+                    if let Some(kv) = self.kv.as_mut() {
+                        kv.written.remove(&id);
+                        kv.scores.remove(&id);
+                        kv.context.remove(&id);
+                        kv.pending.remove(&id);
+                    }
+                    self.waiting.push_front(seq);
+                    return Err(err);
+                }
             }
             admitted.push(seq.id());
             self.running.push(seq);
@@ -422,8 +448,8 @@ impl Scheduler {
             }
             let id = seq.id();
             retired.push(id);
+            self.prompts.remove(&id);
             if let Some(kv) = self.kv.as_mut() {
-                kv.prompts.remove(&id);
                 kv.written.remove(&id);
                 kv.scores.remove(&id);
                 kv.context.remove(&id);
@@ -496,23 +522,124 @@ fn write_row(
     Ok(())
 }
 
-/// Run the prompt one token at a time and store each K/V row in the pool.
+/// Run the prompt one token at a time and store each new K/V row in the pool.
+///
+/// Rows before `shared_len` are already stored in shared prefix blocks and
+/// are not written again. When the whole prompt is shared, the last token
+/// is replayed only to recover the next id.
 #[cfg(feature = "gpt2")]
 fn prefill(
     pool: &mut BlockPool,
     seq: &Sequence,
     tokens: &[u32],
+    shared_len: u32,
 ) -> Result<crate::gpt2::TokenStep, AllocError> {
     let model = crate::gpt2::model()?;
     let mut past = Vec::with_capacity(tokens.len());
+    for index in 0..shared_len {
+        let loc = seq.token_loc(pool.block_size(), index)?;
+        past.push(pool.kv(loc.block, loc.slot)?.to_vec());
+    }
     let mut last = None;
-    for (position, token) in tokens.iter().copied().enumerate() {
+    for (position, token) in tokens.iter().copied().enumerate().skip(shared_len as usize) {
         let step = model.forward_token(token, position, &past)?;
         write_row(pool, seq, position as u32, &step.kv)?;
         past.push(step.kv.clone());
         last = Some(step);
     }
-    last.ok_or_else(|| AllocError::Model("the prompt is empty".to_string()))
+    if let Some(step) = last {
+        return Ok(step);
+    }
+    let last_index = tokens.len() - 1;
+    model.forward_token(tokens[last_index], last_index, &past[..last_index])
+}
+
+/// Block-aligned prefix lengths, longest first. A partial tail is omitted.
+fn prefix_lengths(prompt_len: u32, block_size: u32) -> impl Iterator<Item = u32> {
+    let full_blocks = prompt_len / block_size;
+    (1..=full_blocks)
+        .rev()
+        .map(move |blocks| blocks * block_size)
+}
+
+fn prefix_hash(tokens: &[u32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash ^ tokens.len() as u64
+}
+
+impl Scheduler {
+    /// Longest cached full-block prefix of this prompt. Zero when none fits.
+    fn shared_prefix_len(&self, id: SequenceId, prompt_len: u32) -> u32 {
+        let Some(tokens) = self.prompts.get(&id) else {
+            return 0;
+        };
+        if tokens.len() != prompt_len as usize {
+            return 0;
+        }
+        let block_size = self.pool.block_size();
+        for len in prefix_lengths(prompt_len, block_size) {
+            let slice = &tokens[..len as usize];
+            let key = prefix_hash(slice);
+            if self.prefix_tokens.get(&key).map(Vec::as_slice) != Some(slice) {
+                continue;
+            }
+            if self
+                .prefixes
+                .cached_len(key)
+                .is_some_and(|cached| cached >= len)
+            {
+                return len;
+            }
+        }
+        0
+    }
+
+    fn reserve_prompt(&mut self, seq: &mut Sequence, shared_len: u32) -> Result<(), AllocError> {
+        if shared_len == 0 {
+            return seq.allocate_prompt(&mut self.pool);
+        }
+        let tokens = self
+            .prompts
+            .get(&seq.id())
+            .expect("a shared prefix has token ids")
+            .clone();
+        let key = prefix_hash(&tokens[..shared_len as usize]);
+        match self.prefixes.lookup(&mut self.pool, key, shared_len)? {
+            Some(table) => seq.adopt_prompt(&mut self.pool, table),
+            None => seq.allocate_prompt(&mut self.pool),
+        }
+    }
+
+    fn remember_prefix(&mut self, seq: &Sequence) -> Result<(), AllocError> {
+        let Some(tokens) = self.prompts.get(&seq.id()).cloned() else {
+            return Ok(());
+        };
+        let block_size = self.pool.block_size();
+        for len in prefix_lengths(tokens.len() as u32, block_size) {
+            let slice = tokens[..len as usize].to_vec();
+            let key = prefix_hash(&slice);
+            if self
+                .prefix_tokens
+                .get(&key)
+                .is_some_and(|existing| existing != &slice)
+            {
+                continue;
+            }
+            let forked = seq.fork_prefix(&mut self.pool, len)?;
+            let inserted = self.prefixes.insert(&mut self.pool, key, &forked);
+            let released = forked.release(&mut self.pool);
+            inserted?;
+            released?;
+            self.prefix_tokens.insert(key, slice);
+        }
+        Ok(())
+    }
 }
 
 /// Encode `text` with GPT-2, run that model and decode the ids it produced.
@@ -615,6 +742,25 @@ mod tests {
         assert_eq!(sched.next_waiting().unwrap().id(), third);
         assert_eq!(sched.running()[0].prompt_len(), 4);
         assert_eq!(sched.running()[0].phase(), Phase::Decoding);
+    }
+
+    #[test]
+    fn admission_reuses_a_shared_prefix_without_a_manual_cache_call() {
+        let mut sched = scheduler(3, 4, 2);
+        let first = sched.add_tokens(&[1, 2, 3, 4, 5, 6, 7, 8], 0);
+        let second = sched.add_tokens(&[1, 2, 3, 4, 9, 10, 11, 12], 0);
+
+        assert_eq!(sched.admit().unwrap(), vec![first, second]);
+        let shared = sched.running()[0].blocks()[0];
+        assert_eq!(sched.running()[1].blocks()[0], shared);
+        assert_ne!(
+            sched.running()[0].blocks()[1],
+            sched.running()[1].blocks()[1]
+        );
+        assert!(sched.pool().refcount(shared).unwrap() >= 2);
+        assert_eq!(sched.pool().free_count(), 0);
+        assert_eq!(sched.running()[0].len(), 8);
+        assert_eq!(sched.running()[1].len(), 8);
     }
 
     #[test]
